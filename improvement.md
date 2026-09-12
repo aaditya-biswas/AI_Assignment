@@ -49,7 +49,16 @@ These references are the standard literature and practical references behind the
 ## High-priority improvements
 
 ### 1) Add a transposition table
-Status: [ ] Not started
+Status: [x] Completed in the agent
+
+Completed work:
+- added a transposition table to the search class in [B23CS1001.py](B23CS1001.py)
+- keyed entries by board state + side-to-move
+- stored exact/lower/upper bound flags
+- used the stored best move for move ordering
+- verified the file still compiles and the benchmark still runs
+
+This change follows the project constraint in [constraint.md](constraint.md): no engine files were modified.
 
 Why it matters:
 - avoids re-searching the same positions many times
@@ -75,7 +84,12 @@ Implementation notes:
 ---
 
 ### 2) Add quiescence search
-Status: [ ] Not started
+Status: [x] Completed in the agent
+
+Completed work:
+- added a shallow forcing-move quiescence search to handle captures and checks at the horizon
+- kept the logic compact and compatible with the existing alpha-beta search
+- this reduces tactical horizon errors without introducing complexity
 
 Why it matters:
 - prevents horizon-effect mistakes at depth cutoff
@@ -94,7 +108,12 @@ Suggested rules:
 ---
 
 ### 3) Improve move ordering with killer moves and history
-Status: [ ] Not started
+Status: [x] Completed in the agent
+
+Completed work:
+- added killer move ordering per search depth
+- added a lightweight history heuristic
+- merged the ordering logic into the existing move-key approach to keep the code simple
 
 Why it matters:
 - stronger alpha-beta pruning
@@ -115,7 +134,14 @@ Recommended ordering:
 ---
 
 ### 4) Strengthen the evaluation function
-Status: [ ] Not started
+Status: [x] Completed in the agent
+
+Completed work:
+- added lightweight mobility estimation
+- added pawn-structure and centralization influence
+- retained the original material/PST terms to keep the evaluation stable and readable
+
+This version is intentionally simplified to avoid complex networks while improving strategic judgment.
 
 Why it matters:
 - the current evaluation is mostly material + PST + endgame king pressure

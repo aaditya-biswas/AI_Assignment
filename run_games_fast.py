@@ -13,7 +13,7 @@ from p25cs0004 import P25CS0004             # noqa: E402
 
 BUDGET = 0.35
 MAX_DEPTH = 8
-CAP = 100
+CAP = 150
 
 
 def make(cls, engine):
