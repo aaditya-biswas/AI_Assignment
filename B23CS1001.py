@@ -21,6 +21,7 @@ Search design (alpha-beta negamax + iterative deepening):
   - per-node deadline check -> never blows the 60 second game clock
   - endgame evaluation drives the king forward and the enemy king to the edge
 """
+import math
 import time
 
 from config import (
@@ -42,6 +43,15 @@ PT_VAL = {'P': 20, 'N': 70, 'B': 70, 'R': 100, 'K': 0}
 TT_EXACT = 0
 TT_LOWER = 1
 TT_UPPER = 2
+
+_PIECE_CODES = {
+    '--': 0,
+    'wP': 1, 'bP': 2,
+    'wN': 3, 'bN': 4,
+    'wB': 5, 'bB': 6,
+    'wR': 7, 'bR': 8,
+    'wK': 9, 'bK': 10,
+}
 
 
 class TTEntry:
@@ -101,7 +111,7 @@ class B23CS1001:
         self.wtm = self.engine.white_to_move
 
     def _position_key(self):
-        return (tuple(self.b), self.wtm)
+        return (self.wtm, bytes(_PIECE_CODES.get(p, 0) for p in self.b))
 
     # ------------------------------------------------------------ public API
     def get_best_move(self):
@@ -200,6 +210,19 @@ class B23CS1001:
         return key
 
     # ---------------------------------------------------------------- search
+    def _lmr_reduction(self, depth, idx):
+        if depth <= 2 or idx <= 2:
+            return 0
+        return max(0, 1 + int(math.log(depth) * math.log(idx + 1) / 2.0))
+
+    def _null_move_allowed(self, in_check, depth):
+        if in_check or depth < 2:
+            return False
+        for p in self.b:
+            if p != ES and p[1] != 'K':
+                return True
+        return False
+
     def _negamax(self, depth, alpha, beta, ply):
         b = self.b
         self.nodes_expanded += 1
@@ -224,35 +247,52 @@ class B23CS1001:
 
         myk, opk, in_check, few, drive = self._snapshot()
 
-        if depth <= 0 and not in_check and not few:
-            return self._evaluate_stm()
+        if depth <= 0:
+            return self._quiescence(alpha, beta)
         if ply > self.max_ply:
             return self._evaluate_stm()
+
+        if not in_check:
+            stand_pat = self._evaluate_stm()
+            if depth <= 3 and stand_pat - 120 * depth >= beta:
+                return stand_pat
+            if self._null_move_allowed(in_check, depth):
+                self.wtm = not self.wtm
+                score = -self._negamax(depth - 2, -beta, -beta + 1, ply + 1)
+                self.wtm = not self.wtm
+                if score >= beta:
+                    return beta
 
         legal = self._legal_moves(myk, drive, opk)
         if not legal:
             return -(MATE - ply) if in_check else 0
-        if depth <= 0 and few and not in_check:
-            return self._evaluate_stm()
 
         tt_move = None if entry is None else entry.best_move
         ordered = sorted(
             legal,
-            key=lambda m: self._move_key(m, drive)
-            if tt_move is None or (m[0], m[1]) != tt_move
-            else -10**9,
+            key=lambda m: self._ordering_key(m, drive, depth, tt_move),
         )
 
         best_move = None
         alpha_orig = alpha
         best_score = -MATE
-        for fr, to, captured, gives in ordered:
+        for idx, (fr, to, captured, gives) in enumerate(ordered):
             piece = b[fr]
             b[to] = piece
             b[fr] = ES
             self.wtm = not self.wtm
             try:
-                score = -self._negamax(max(depth - 1, 0), -beta, -alpha, ply + 1)
+                if idx == 0:
+                    score = -self._negamax(depth - 1, -beta, -alpha, ply + 1)
+                else:
+                    search_depth = depth - 1
+                    if depth >= 3 and captured == ES and not gives and not in_check:
+                        search_depth -= self._lmr_reduction(depth, idx)
+                    score = -self._negamax(max(search_depth, 0), -alpha - 1, -alpha, ply + 1)
+                    if score > alpha and search_depth != depth - 1 and score < beta:
+                        score = -self._negamax(depth - 1, -beta, -alpha, ply + 1)
+                    elif score > alpha and search_depth == depth - 1 and score < beta:
+                        score = -self._negamax(depth - 1, -beta, -alpha, ply + 1)
             except _AbortSearch:
                 b[fr] = piece
                 b[to] = captured
@@ -269,6 +309,9 @@ class B23CS1001:
             if alpha >= beta:
                 break
 
+        if best_move is not None:
+            self._record_killer(depth, best_move)
+            self.history[best_move] = self.history.get(best_move, 0) + max(1, depth * depth)
         if best_score <= alpha_orig:
             flag = TT_UPPER
         elif best_score >= beta:
@@ -278,9 +321,11 @@ class B23CS1001:
         self.tt[key] = TTEntry(depth, flag, best_score, best_move)
         return best_score
 
-    def _ordering_key(self, move, drive, depth):
+    def _ordering_key(self, move, drive, depth, tt_move=None):
         fr, to, captured, gives = move
         key = 0
+        if tt_move is not None and (fr, to) == tt_move:
+            key -= 10**9
         if drive and gives:
             key -= 300000
         if captured != ES:
@@ -293,21 +338,18 @@ class B23CS1001:
         return key
 
     def _record_killer(self, depth, move):
-        lst = self.killers.setdefault(depth, [])
-        if move in lst:
+        if move is None:
             return
-        lst.insert(0, move)
+        fr, to = move
+        lst = self.killers.setdefault(depth, [])
+        if (fr, to) in lst:
+            return
+        lst.insert(0, (fr, to))
         if len(lst) > 2:
             lst.pop()
 
-    def _move_key(self, move, drive):
-        fr, to, captured, gives = move
-        if drive and gives:
-            return -300000
-        if captured != ES:
-            victim = PT_VAL.get(captured[1], 0)
-            return -100000 - victim * 100
-        return 0
+    def _move_key(self, move, drive, depth=0, tt_move=None):
+        return self._ordering_key(move, drive, depth, tt_move)
 
     def _quiescence(self, alpha, beta):
         """Search only forcing moves: captures and checks."""
@@ -549,127 +591,122 @@ class B23CS1001:
         v = self._evaluate_white()
         return v if self.wtm else -v
 
-    def _mobility_bonus(self, color):
-        my = color
-        opp = 'b' if color == 'w' else 'w'
-        my_legal = 0
-        opp_legal = 0
+    def _scan_board(self):
+        b = self.b
+        stats = {
+            'w_king': -1,
+            'b_king': -1,
+            'mobility': {'w': 0, 'b': 0},
+            'pawn_structure': {'w': 0, 'b': 0},
+            'passed': {'w': 0, 'b': 0},
+            'king_safety': {'w': 0, 'b': 0},
+            'material': {'w': 0, 'b': 0},
+            'pst': {'w': 0, 'b': 0},
+            'center': {'w': 0, 'b': 0},
+            'count': {'w': 0, 'b': 0},
+        }
         for i in range(48):
-            p = self.b[i]
-            if p == ES or p[0] != my:
+            p = b[i]
+            if p == ES:
                 continue
             r, c = divmod(i, BW)
-            if p[1] == 'P':
-                dr = -1 if my == 'w' else 1
-                nr = r + dr
-                if 0 <= nr < BH and 0 <= c < BW and self.b[_idx(nr, c)] == ES:
-                    my_legal += 1
-                for dc in (-1, 1):
+            color, ptype = p[0], p[1]
+            opp = 'b' if color == 'w' else 'w'
+            stats['count'][color] += 1
+            if ptype == 'K':
+                if color == 'w':
+                    stats['w_king'] = i
+                else:
+                    stats['b_king'] = i
+                continue
+            stats['material'][color] += abs(PIECE_VALUES[p])
+            if ptype in PST:
+                table = PST[ptype]
+                if color == 'w':
+                    stats['pst'][color] += table[r][c]
+                else:
+                    stats['pst'][color] += table[BH - 1 - r][c]
+            if ptype in ('N', 'B', 'R'):
+                center_dist = abs(r - 3) + abs(c - 2)
+                if color == 'w':
+                    stats['center'][color] += max(0, 3 - center_dist)
+                else:
+                    stats['center'][color] += max(0, 3 - center_dist)
+            if ptype == 'P':
+                if color == 'w':
+                    stats['pawn_structure'][color] += r
+                else:
+                    stats['pawn_structure'][color] += (BH - 1 - r)
+                blocked = False
+                for dc in (-1, 0, 1):
                     nc = c + dc
-                    if 0 <= nr < BH and 0 <= nc < BW and self.b[_idx(nr, nc)][0] == opp:
-                        my_legal += 1
-            elif p[1] == 'N':
-                my_legal += 8
-            elif p[1] == 'B':
-                my_legal += 7
-            elif p[1] == 'R':
-                my_legal += 6
-            elif p[1] == 'K':
-                my_legal += 5
+                    if 0 <= nc < BW:
+                        rr = r + (1 if color == 'w' else -1)
+                        if 0 <= rr < BH and b[_idx(rr, nc)] == opp + 'P':
+                            blocked = True
+                            break
+                if not blocked:
+                    stats['passed'][color] += 20 + (BH - 1 - r if color == 'w' else r)
+            mobility_value = {
+                'P': 1,
+                'N': 8,
+                'B': 7,
+                'R': 6,
+                'K': 5,
+            }.get(ptype, 0)
+            if mobility_value:
+                stats['mobility'][color] += mobility_value
 
         for i in range(48):
-            p = self.b[i]
-            if p == ES or p[0] != opp:
+            p = b[i]
+            if p == ES or p[1] == 'K':
                 continue
             r, c = divmod(i, BW)
-            if p[1] == 'P':
-                dr = -1 if opp == 'w' else 1
-                nr = r + dr
-                if 0 <= nr < BH and 0 <= c < BW and self.b[_idx(nr, c)] == ES:
-                    opp_legal += 1
-                for dc in (-1, 1):
-                    nc = c + dc
-                    if 0 <= nr < BH and 0 <= nc < BW and self.b[_idx(nr, nc)][0] == my:
-                        opp_legal += 1
-            elif p[1] == 'N':
-                opp_legal += 8
-            elif p[1] == 'B':
-                opp_legal += 7
-            elif p[1] == 'R':
-                opp_legal += 6
-            elif p[1] == 'K':
-                opp_legal += 5
-        return my_legal - opp_legal
+            color = p[0]
+            opp = 'b' if color == 'w' else 'w'
+            kr = stats['w_king'] if color == 'w' else stats['b_king']
+            if kr < 0:
+                continue
+            kc = kr % BW
+            kr //= BW
+            if abs(r - kr) <= 2 and abs(c - kc) <= 2:
+                stats['king_safety'][color] += 2
+            foe_king = stats['b_king'] if color == 'w' else stats['w_king']
+            if foe_king >= 0:
+                fr, fc = divmod(foe_king, BW)
+                if abs(r - fr) <= 2 and abs(c - fc) <= 2:
+                    stats['king_safety'][color] -= 2
+
+        return stats
+
+    def _mobility_bonus(self, color):
+        stats = self._scan_board()
+        opp = 'b' if color == 'w' else 'w'
+        return stats['mobility'][color] - stats['mobility'][opp]
 
     def _pawn_structure_bonus(self, color):
-        score = 0
-        for i in range(48):
-            p = self.b[i]
-            if p == ES or p[0] != color:
-                continue
-            if p[1] != 'P':
-                continue
-            r, c = divmod(i, BW)
-            if color == 'w':
-                score += r
-            else:
-                score += (BH - 1 - r)
-        return score
+        stats = self._scan_board()
+        return stats['pawn_structure'][color]
 
     def _passed_pawn_bonus(self, color):
-        score = 0
-        foe = 'b' if color == 'w' else 'w'
-        for i in range(48):
-            p = self.b[i]
-            if p == ES or p[0] != color or p[1] != 'P':
-                continue
-            r, c = divmod(i, BW)
-            blocked = False
-            for dc in (-1, 0, 1):
-                nc = c + dc
-                if 0 <= nc < BW:
-                    rr = r + (1 if color == 'w' else -1)
-                    if 0 <= rr < BH and self.b[_idx(rr, nc)] == foe + 'P':
-                        blocked = True
-            if blocked:
-                continue
-            score += 20 + (BH - 1 - r if color == 'w' else r)
-        return score
+        stats = self._scan_board()
+        return stats['passed'][color]
 
     def _king_safety_bonus(self, color):
-        king = self._find_king(color)
-        if king < 0:
-            return 0
-        kr, kc = divmod(king, BW)
-        score = 0
-        for i in range(48):
-            p = self.b[i]
-            if p == ES or p[0] != color:
-                continue
-            if p[1] == 'K':
-                continue
-            r, c = divmod(i, BW)
-            if abs(r - kr) <= 2 and abs(c - kc) <= 2:
-                score += 2
-        foe = 'b' if color == 'w' else 'w'
-        for i in range(48):
-            p = self.b[i]
-            if p == ES or p[0] != foe:
-                continue
-            if p[1] == 'K':
-                continue
-            r, c = divmod(i, BW)
-            if abs(r - kr) <= 2 and abs(c - kc) <= 2:
-                score -= 2
-        return score
+        stats = self._scan_board()
+        return stats['king_safety'][color]
 
     def _evaluate_white(self):
         """Static evaluation with light mobility, passed-pawn, and king-safety terms."""
         b = self.b
+        stats = self._scan_board()
         total = 0
-        w_king = b_king = -1
-        w_pow = b_pow = 0
-        w_nk = b_nk = 0
+        w_king = stats['w_king']
+        b_king = stats['b_king']
+        w_pow = stats['material']['w']
+        b_pow = stats['material']['b']
+        w_nk = stats['count']['w']
+        b_nk = stats['count']['b']
         for i in range(48):
             p = b[i]
             if p == ES:
@@ -678,14 +715,8 @@ class B23CS1001:
             c = i - r * BW
             color, ptype = p[0], p[1]
             if ptype == 'K':
-                if color == 'w':
-                    w_king = i
-                else:
-                    b_king = i
                 continue
             if color == 'w':
-                w_pow += PIECE_VALUES[p]
-                w_nk += 1
                 total += PIECE_VALUES[p]
                 if ptype in PST:
                     total += PST[ptype][r][c]
@@ -694,8 +725,6 @@ class B23CS1001:
                     center_dist = abs(cr - 3) + abs(cc - 2)
                     total += max(0, 3 - center_dist)
             else:
-                b_pow += -PIECE_VALUES[p]
-                b_nk += 1
                 total -= PIECE_VALUES[p]
                 if ptype in PST:
                     mr = BH - 1 - r
@@ -712,14 +741,14 @@ class B23CS1001:
             br, bc = divmod(b_king, BW)
             total -= 4 - min(abs(br - 3), 3) - min(abs(bc - 2), 3)
 
-        total += self._mobility_bonus('w') * 2
-        total -= self._mobility_bonus('b') * 2
-        total += self._pawn_structure_bonus('w') // 3
-        total -= self._pawn_structure_bonus('b') // 3
-        total += self._passed_pawn_bonus('w')
-        total -= self._passed_pawn_bonus('b')
-        total += self._king_safety_bonus('w')
-        total -= self._king_safety_bonus('b')
+        total += stats['mobility']['w'] * 2
+        total -= stats['mobility']['b'] * 2
+        total += stats['pawn_structure']['w'] // 3
+        total -= stats['pawn_structure']['b'] // 3
+        total += stats['passed']['w']
+        total -= stats['passed']['b']
+        total += stats['king_safety']['w']
+        total -= stats['king_safety']['b']
 
         if w_nk + b_nk <= 6 and w_king >= 0 and b_king >= 0:
             wr, wc = divmod(w_king, BW)

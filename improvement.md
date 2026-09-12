@@ -46,6 +46,27 @@ These references are the standard literature and practical references behind the
 
 ---
 
+## Validity check against the assignment constraints
+
+The SOTA ideas listed below are valid as high-level chess-engine concepts, but they are not all compatible with the rules in [constraint.md](constraint.md).
+
+The following are acceptable as agent-side upgrades inside [B23CS1001.py](B23CS1001.py):
+- Principal Variation Search (PVS / NegaScout)
+- Null Move Pruning (NMP)
+- Late Move Reductions (LMR)
+- Reverse Futility Pruning (RFP)
+- improved TT usage and move ordering
+- quiescence search integration at the horizon
+- agent-local compact board-key optimization
+
+Not allowed under the assignment rules:
+- modifying the game engine or core rules in [board.py](board.py) or [config.py](config.py)
+- engine-level bitboard migration or board rewrite in the official engine
+- engine-side incremental evaluation changes that alter the tournament backend
+- any change that would require multiple Python files or a different submission structure
+
+In practice, the strongest route is to keep the agent single-file and engine-agnostic while applying the search and evaluation upgrades inside [B23CS1001.py](B23CS1001.py).
+
 ## High-priority improvements
 
 ### 1) Add a transposition table
