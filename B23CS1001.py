@@ -153,7 +153,6 @@ for _r in range(BH):
 
 MATE_BOUND = MATE - 1000   # scores beyond this encode mate distances
 QMAX = 6                   # quiescence depth cap
-CHECK_EXT_CAP = 24         # ply cap for the bounded check extension
 
 # Inverse pawn tables: the squares a white/black pawn would have to stand on in
 # order to attack a given square (same geometry as the opposite pawn's captures).
@@ -189,13 +188,11 @@ class B23CS1001:
         self.test_budget = None
         self.max_ply = 60
         self._deadline = None
-        self._search_nodes = 0
         self.b = None
         self.wtm = True
         self.tt = {}
         self.killers = {}
         self.history = [0] * (48 * 48)
-        self.counter = [-1] * (48 * 48)
         self.qnodes = 0
 
     # ------------------------------------------------------------- setup
@@ -236,7 +233,6 @@ class B23CS1001:
             budget = self.test_budget
         deadline = t0 + budget
         self._deadline = deadline
-        self._search_nodes = 0
 
         best = None
         prev_score = None
@@ -338,11 +334,6 @@ class B23CS1001:
         return key
 
     # ---------------------------------------------------------------- search
-    def _lmr_reduction(self, depth, idx):
-        if depth <= 2 or idx <= 2:
-            return 0
-        return _LMR[depth if depth < 64 else 63][idx if idx < 64 else 63]
-
     def _null_move_allowed(self, in_check, depth):
         if in_check or depth < 2:
             return False
@@ -351,12 +342,12 @@ class B23CS1001:
                 return True
         return False
 
-    def _negamax(self, depth, alpha, beta, ply, prev=-1):
+    def _negamax(self, depth, alpha, beta, ply):
         b = self.b
+        ng = self._negamax          # local binding speeds up recursion
         self.nodes_expanded += 1
-        self._search_nodes += 1
 
-        if (self._search_nodes & 255) == 0 and self._deadline is not None \
+        if (self.nodes_expanded & 255) == 0 and self._deadline is not None \
             and time.monotonic() >= self._deadline:
             raise _AbortSearch()
 
@@ -384,12 +375,14 @@ class B23CS1001:
                 if value < beta:
                     beta = value
 
-        myk, opk, in_check, few, drive = self._snapshot()
-
+        # Horizon handling runs before the board scan: quiescence and the eval
+        # recompute what they need, so _snapshot is skipped at leaf nodes.
         if depth <= 0:
             return self._quiescence(alpha, beta)
         if ply > self.max_ply:
             return self._evaluate_stm()
+
+        myk, opk, in_check, few, drive = self._snapshot()
 
         stand_pat = None
         if not in_check:
@@ -399,22 +392,20 @@ class B23CS1001:
                     return stand_pat
             if self._null_move_allowed(in_check, depth):
                 self.wtm = not self.wtm
-                score = -self._negamax(depth - 2, -beta, -beta + 1, ply + 1,
-                                       -1)
+                score = -ng(depth - 2, -beta, -beta + 1, ply + 1)
                 self.wtm = not self.wtm
                 if score >= beta:
                     return beta
 
-        legal = self._legal_moves(myk, drive, opk)
+        legal = self._legal_moves(myk, drive, opk, in_check)
         if not legal:
             return -(MATE - ply) if in_check else 0
 
         # Ordering inputs are hoisted out of the per-move key function (the
-        # killer lookup and counter-move lookup used to run once per move).
+        # killer lookup used to run once per move inside the key lambda).
         killers = self.killers.get(depth, ())
         k0 = killers[0] if killers else -1
         k1 = killers[1] if len(killers) > 1 else -1
-        cm = self.counter[prev] if prev >= 0 else -1
         if tt_move is not None:
             tt_fr, tt_to = tt_move
         else:
@@ -423,42 +414,31 @@ class B23CS1001:
         ordered = sorted(
             legal,
             key=lambda m: self._order_key(m, drive, b, tt_fr, tt_to,
-                                          k0, k1, cm, hist),
+                                          k0, k1, hist),
         )
 
         best_move = None
         alpha_orig = alpha
         best_score = -MATE
-        # Bounded check extension: resolve checks one ply deeper (ply-capped).
-        ext = 1 if (in_check and ply < CHECK_EXT_CAP) else 0
-        # Late move pruning: at shallow non-check nodes, drop late quiet moves.
-        lmp_limit = (3 + depth * depth) if (not in_check and depth <= 3) \
-            else 1000
         for idx, (fr, to, captured, gives) in enumerate(ordered):
-            if idx >= lmp_limit and captured == E and not gives:
-                continue
-            nmove = fr * 48 + to
             piece = b[fr]
             b[to] = piece
             b[fr] = E
             self.wtm = not self.wtm
             try:
                 if idx == 0:
-                    score = -self._negamax(depth - 1 + ext, -beta, -alpha,
-                                           ply + 1, nmove)
+                    score = -ng(depth - 1, -beta, -alpha, ply + 1)
                 else:
-                    search_depth = depth - 1 + ext
+                    search_depth = depth - 1
                     if depth >= 3 and captured == E and not gives \
                             and not in_check:
-                        search_depth -= self._lmr_reduction(depth, idx)
+                        search_depth -= _LMR[depth if depth < 64 else 63][idx]
                     if search_depth < 0:
                         search_depth = 0
-                    score = -self._negamax(search_depth, -alpha - 1, -alpha,
-                                           ply + 1, nmove)
+                    score = -ng(search_depth, -alpha - 1, -alpha, ply + 1)
                     if score > alpha and score < beta:
                         # PVS re-search with the full window.
-                        score = -self._negamax(depth - 1 + ext, -beta, -alpha,
-                                               ply + 1, nmove)
+                        score = -ng(depth - 1, -beta, -alpha, ply + 1)
             except _AbortSearch:
                 b[fr] = piece
                 b[to] = captured
@@ -478,9 +458,6 @@ class B23CS1001:
         if best_move is not None:
             bmove = best_move[0] * 48 + best_move[1]
             self._record_killer(depth, best_move)
-            if prev >= 0 and best_score >= beta:
-                # Counter-move: remember this reply to the opponent's move.
-                self.counter[prev] = bmove
             hbonus = depth * depth
             hval = self.history[bmove]
             # Bounded ("gravity") update keeps early scores from dominating.
@@ -515,9 +492,9 @@ class B23CS1001:
         key -= self.history[ht]
         return key
 
-    def _order_key(self, move, drive, b, tt_fr, tt_to, k0, k1, cm, hist):
+    def _order_key(self, move, drive, b, tt_fr, tt_to, k0, k1, hist):
         """Hot ordering key with all lookups pre-resolved by the caller
-        (TT move, killers, counter-move and history are passed in)."""
+        (TT move, killers and history are passed in)."""
         fr, to, captured, gives = move
         key = 0
         if fr == tt_fr and to == tt_to:
@@ -530,8 +507,6 @@ class B23CS1001:
         ht = fr * 48 + to
         if ht == k0 or ht == k1:
             key -= 50000
-        elif ht == cm:
-            key -= 45000
         key -= hist[ht]
         return key
 
@@ -546,7 +521,7 @@ class B23CS1001:
         if len(lst) > 2:
             lst.pop()
 
-    def _capture_moves(self, ksq, opp):
+    def _capture_moves(self, ksq, opp, in_check=False):
         """Legal capture moves only (used by quiescence; avoids generating
         quiet moves and keeps the delta-pruning friendly 4-tuple shape)."""
         b = self.b
@@ -592,8 +567,21 @@ class B23CS1001:
                             if (tp < 6) != my_white:
                                 ap((i, t, tp))
                             break
+        if not found:
+            return []
         legal = []
+        if in_check or ksq < 0:
+            pinned = 0
+            test_all = True
+        else:
+            # Same pin shortcut as _legal_moves: only king moves and pinned
+            # pieces can expose the king, so most captures skip the test.
+            pinned = self._pinned_squares(ksq, opp)
+            test_all = False
         for fr, to, captured in found:
+            if not (test_all or fr == ksq or (pinned >> fr) & 1):
+                legal.append((fr, to, captured, False))
+                continue
             piece = b[fr]
             b[to] = piece
             b[fr] = E
@@ -625,7 +613,7 @@ class B23CS1001:
         in_check = myk >= 0 and self._attacked(myk, opp)
 
         if in_check:
-            legal = self._legal_moves(myk)
+            legal = self._legal_moves(myk, False, -1, True)
             if not legal:
                 return -(MATE - 1)
             if qdepth >= QMAX:
@@ -771,10 +759,10 @@ class B23CS1001:
         return False
 
     def _pinned_squares(self, ksq, opp):
-        """Own pieces standing between the king and an enemy slider on the
-        same line (only these quiet moves can ever expose the king)."""
+        """Bitmask of own pieces standing between the king and an enemy slider
+        (only these quiet moves can ever expose the king)."""
         b = self.b
-        pinned = set()
+        pinned = 0
         opp_white = opp == 'w'
         bishop = WB if opp_white else BB
         rook = WR if opp_white else BR
@@ -789,7 +777,7 @@ class B23CS1001:
                         first = t
                     else:
                         if p == rook:
-                            pinned.add(first)
+                            pinned |= 1 << first
                         break
         for ray in _BISHOP_RAYS[ksq]:
             first = -1
@@ -802,11 +790,11 @@ class B23CS1001:
                         first = t
                     else:
                         if p == bishop:
-                            pinned.add(first)
+                            pinned |= 1 << first
                         break
         return pinned
 
-    def _legal_moves(self, ksq, drive=False, opk=-1):
+    def _legal_moves(self, ksq, drive=False, opk=-1, in_check=None):
         """Legal moves as (from, to, captured, gives_check) tuples.
 
         Rules mirror board.py exactly (generate-then-validate); the king of the
@@ -875,10 +863,12 @@ class B23CS1001:
         # Only king moves and pinned-piece moves can expose the king, so when
         # not in check (and not driving for mate, which needs `gives`) the
         # expensive attack test is skipped for every other move.
-        must_test = self._attacked(ksq, opp) or (drive and opk >= 0)
-        pinned = set() if must_test else self._pinned_squares(ksq, opp)
+        if in_check is None:
+            in_check = self._attacked(ksq, opp)
+        must_test = in_check or (drive and opk >= 0)
+        pinned = 0 if must_test else self._pinned_squares(ksq, opp)
         for fr, to in pseudo:
-            if not (must_test or fr == ksq or fr in pinned):
+            if not (must_test or fr == ksq or (pinned >> fr) & 1):
                 legal.append((fr, to, b[to], False))
                 continue
             captured = b[to]

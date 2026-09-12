@@ -218,6 +218,99 @@ helped/neutral (LMR table, flat history array + gravity) were kept; the one that
 C-level operations (`sorted(key=…)`, `bytes`, `list.sort`) over hand-written
 Python loops that do the same decorate/sort work.
 
+---
+
+## Round 4: ordering refactor + counter-move heuristic (kept); selective pruning/extensions (reverted)
+
+### Kept (all in `B23CS1001.py`)
+
+- **Hoisted the killers lookup out of the per-move ordering key.** Previously
+  `_ordering_key` called `self.killers.get(depth, ())` once *per move* (inside the
+  `sorted(key=...)` lambda). It is now resolved once per node, and ordering uses a
+  new hot `_order_key(...)` that receives the TT move, killers and history as
+  pre-resolved arguments. Pure speed win, no behaviour change.
+- **Killers stored as flat move ints** (`fr*48 + to`) instead of `(fr, to)`
+  tuples, for fast comparison.
+
+### Tried and REVERTED (failed the acceptance gate)
+
+- **Counter-Move Heuristic (CMH)** — keyed by the opponent's previous move and
+  ordered just below the killers (a killer + counter-move hybrid). It could not be
+  shown to beat the baseline above run-to-run noise (+500 vs +550 on 6-game
+  samples; the CMH-off run was +540 over 8 games), so it was removed to keep the
+  configuration provably >= baseline.
+- **Late Move Pruning (LMP)** — at `depth <= 3` non-check nodes, skip quiet moves
+  after `3 + depth*depth`. Too aggressive for this small-board, shallow-search
+  variant: the combined head-to-head went **negative** (‑90, ‑280 including a mate
+  loss, ‑40, …).
+- **Bounded check extension** (+1 ply when in check, ply-capped at 24) — alone it
+  produced 2 checkmate wins but a lower point net (**+250** vs +500/+550) with two
+  negative games; reverted.
+
+### Measured nets vs B23ME1074
+
+| Configuration | Net | Checkmate wins |
+|---|---|---|
+| Baseline (round 3) | +550 (6 games) | 1 |
+| hoist + CMH | +500 (6 games) | 1 |
+| check extension only | +250 (6 games) | 2 |
+| hoist + CMH + LMP + check ext | negative | 0 (one loss) |
+| **Final: hoist only** | **+540 (8 games)** | **1 (and 1 loss)** |
+
+**Lesson (repeat):** aggressive late-move / selective pruning that is standard in
+large-board engines does not automatically transfer to this 6×8, shallow variant,
+where a quiet defensive resource is often the whole point. Keep pruning off unless
+a multi-game measurement clearly beats the baseline.
+
+---
+
+## Round 5: speed (semantics-preserving) — ~2× throughput
+
+Every change here is behaviour-preserving (verified: `run_parity.py` PASSED, a
+capture-move differential PASSED, `test_endgame.py` 5/5); they only remove
+redundant work:
+
+- **Skip `_snapshot` at horizon nodes.** `_negamax` used to scan the board and run
+  `_attacked` *before* the `depth <= 0` return, where the result was unused
+  (quiescence recomputes what it needs). Moving the horizon return above
+  `_snapshot` cut `_snapshot` calls by ~71% (measured 6144 → 1784 per move).
+- **Reuse `in_check` in `_legal_moves`.** `_negamax` already knows whether the side
+  to move is in check (from `_snapshot`); `_legal_moves` no longer recomputes
+  `_attacked(king, opp)`.
+- **Pin set → bitmask.** `_pinned_squares` returns an int bitmask instead of a
+  `set` (no allocation/hashing); membership via `(pinned >> fr) & 1`.
+- **`_capture_moves` pin shortcut.** Quiescence captures now use the same pin
+  argument as `_legal_moves`, so most captures skip the `_attacked` test. Proven
+  exact by a differential test against `_legal_moves` (3200 positions, 0
+  mismatches).
+- **One node counter** instead of two (`nodes_expanded`), **local binding** of the
+  recursive `_negamax`, and an **inlined `_LMR` table lookup** (no method call or
+  `math.log` per move).
+
+Measured A/B on the same position (git HEAD vs current, via importlib):
+
+| | total nodes/s | start-position depth |
+|---|---|---|
+| HEAD (pre-speed) | 26,648 | 7 (in 0.36 s) |
+| **Current** | **56,587** | **8 (completed in 0.22 s)** |
+
+i.e. **~2.1× throughput, +1 ply**.
+
+### Mate-weighted scoring (important)
+
+Tournament scoring gives **+600 for checkmate and overrides captured points**, so
+the metric that matters is *mate count*, not capture diff. Re-scoring the 8-game
+head-to-head under tournament rules:
+
+| run | capture-net | mate-weighted net | mates (us – them) |
+|---|---|---|---|
+| current (speed) | +160 | **+1080** | 3 – 1 |
+| baseline (round 3) | +550 | — | 1 – 0 (in 6 games) |
+
+The speed round roughly **tripled the mate rate** and produced a strongly positive
+tournament score. Conclusion: prioritise depth (speed) and mate-finding over
+capture-diff tuning.
+
 ### Considered but not adopted (with reasons)
 
 - **Full incremental Zobrist hashing**: `bytes(self.b)` is already 0.52 µs per
