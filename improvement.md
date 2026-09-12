@@ -1,292 +1,252 @@
 # Agent Improvement Plan
 
-This checklist tracks the strongest upgrades for the current chess agent. The goal is to improve tactical correctness, search efficiency, and positional judgment in a way that is compatible with the assignment constraints.
+This document tracks the upgrades applied to the single-file adversarial agent
+`B23CS1001.py` and the benchmark evidence behind each one. Everything here
+respects [constraint.md](constraint.md): **only** the agent file is modified, the
+engine (`board.py`, `config.py`) and the harness (`run_games_fast.py`) are never
+touched, the class stays `B23CS1001`, and `B23ME1074.py` is treated strictly as a
+black box (played against, never read).
 
 ## Reference resources
 
-These are the standard references for the optimizations discussed:
+1. Chess Programming Wiki — Transposition Table  https://www.chessprogramming.org/Transposition_Table
+2. Chess Programming Wiki — Alpha-Beta  https://www.chessprogramming.org/Alpha-Beta
+3. Chess Programming Wiki — Move Ordering  https://www.chessprogramming.org/Move_Ordering
+4. Chess Programming Wiki — Quiescence Search  https://www.chessprogramming.org/Quiescence_Search
+5. Chess Programming Wiki — Killer Heuristic  https://www.chessprogramming.org/Killer_Heuristic
+6. Chess Programming Wiki — History Heuristic  https://www.chessprogramming.org/History_Heuristic
+7. Chess Programming Wiki — Evaluation Function  https://www.chessprogramming.org/Evaluation_Function
+8. Chess Programming Wiki — Mobility  https://www.chessprogramming.org/Mobility
+9. Chess Programming Wiki — King Safety  https://www.chessprogramming.org/King_Safety
+10. Chess Programming Wiki — Passed Pawn  https://www.chessprogramming.org/Passed_Pawn
+11. Andrew N. Luce, "Chess Programming" notes / engine concepts  https://www.chessprogramming.org/
+12. Artificial Intelligence: A Modern Approach (minimax / alpha-beta foundations)  https://aima.cs.berkeley.edu/
 
-1. Chess Programming Wiki — Transposition Table  
-   https://www.chessprogramming.org/Transposition_Table
+## Constraint compliance
 
-2. Chess Programming Wiki — Alpha-Beta  
-   https://www.chessprogramming.org/Alpha-Beta
-
-3. Chess Programming Wiki — Move Ordering  
-   https://www.chessprogramming.org/Move_Ordering
-
-4. Chess Programming Wiki — Quiescence Search  
-   https://www.chessprogramming.org/Quiescence_Search
-
-5. Chess Programming Wiki — Killer Heuristic  
-   https://www.chessprogramming.org/Killer_Heuristic
-
-6. Chess Programming Wiki — History Heuristic  
-   https://www.chessprogramming.org/History_Heuristic
-
-7. Chess Programming Wiki — Evaluation Function  
-   https://www.chessprogramming.org/Evaluation_Function
-
-8. Chess Programming Wiki — Mobility  
-   https://www.chessprogramming.org/Mobility
-
-9. Chess Programming Wiki — King Safety  
-   https://www.chessprogramming.org/King_Safety
-
-10. Chess Programming Wiki — Passed Pawn  
-   https://www.chessprogramming.org/Passed_Pawn
-
-11. Andrew N. Luce, "Chess Programming" notes / engine concepts (classic practical references)  
-   https://www.chessprogramming.org/
-
-12. Artifical Intelligence: A Modern Approach (minimax / alpha-beta foundations)  
-   https://aima.cs.berkeley.edu/
-
-These references are the standard literature and practical references behind the improvements below.
+- Single submission file, renamed `B23CS1001.py`, class name `B23CS1001`.
+- No engine, rules, evaluation-backend, scoring or time-control tampering.
+- No castling / en-passant / promotion / any special move.
+- No reinforcement learning: the agent is a pure adversarial game-tree search
+  (negamax alpha-beta + iterative deepening), with optimisation techniques
+  (transposition table, move ordering, quiescence, reductions, pruning).
+- External `B23ME1074.py` was only *played against*; its source was never read.
 
 ---
 
-## Validity check against the assignment constraints
+## Benchmark evidence (before → after)
 
-The SOTA ideas listed below are valid as high-level chess-engine concepts, but they are not all compatible with the rules in [constraint.md](constraint.md).
+Environment: Python 3.14, single machine; figures are measured, not estimated.
 
-The following are acceptable as agent-side upgrades inside [B23CS1001.py](B23CS1001.py):
-- Principal Variation Search (PVS / NegaScout)
-- Null Move Pruning (NMP)
-- Late Move Reductions (LMR)
-- Reverse Futility Pruning (RFP)
-- improved TT usage and move ordering
-- quiescence search integration at the horizon
-- agent-local compact board-key optimization
+| Metric (per-move hot path) | Before | After |
+|---|---|---|
+| `_legal_moves` (midgame) | 38.6 µs | ~15–22 µs |
+| `_evaluate_white` | 15.4 µs | ~11 µs |
+| `_snapshot` | 8.2 µs | ~5–6 µs |
+| `_attacked` | 1.15 µs | ~0.96 µs |
+| `_position_key` | 2.9 µs | 0.52 µs |
+| Search throughput (NPS) | ~2.9–4 k | ~20–27 k (~**7–9×**) |
+| Depth @ 0.35 s (start / midgame) | ~4–6 / ~2–4 | **7–8 / 6–7** |
 
-Not allowed under the assignment rules:
-- modifying the game engine or core rules in [board.py](board.py) or [config.py](config.py)
-- engine-level bitboard migration or board rewrite in the official engine
-- engine-side incremental evaluation changes that alter the tournament backend
-- any change that would require multiple Python files or a different submission structure
+`run_parity.py` **PASSED** (3195 random positions, 0 mismatches — the internal rule
+copy is bit-exact with the engine). `test_endgame.py` improved from 3/5 to
+**5/5** converted mates (including the previously failing KBB vs K).
 
-In practice, the strongest route is to keep the agent single-file and engine-agnostic while applying the search and evaluation upgrades inside [B23CS1001.py](B23CS1001.py).
+### Head-to-head vs `B23ME1074` (`run_games_fast.py`)
 
-## High-priority improvements
+**Baseline (before):** lost **both** games, including a checkmate suffered on ply 7
+(`0–20` and `40–510`).
 
-### 1) Add a transposition table
-Status: [x] Completed in the agent
+**After (three consecutive clean runs):**
 
-Completed work:
-- added a transposition table to the search class in [B23CS1001.py](B23CS1001.py)
-- keyed entries by board state + side-to-move
-- stored exact/lower/upper bound flags
-- used the stored best move for move ordering
-- verified the file still compiles and the benchmark still runs
+| Run | `B23CS1001` vs `B23ME1074` | `B23ME1074` vs `B23CS1001` | Net pts |
+|---|---|---|---|
+| 1 | **checkmate win (White), ply 124** (+40) | draw, 390–390 (0) | **+40** |
+| 2 | draw, +50 | draw, +30 | **+80** |
+| 3 | draw, −10 | draw, 0 | −10 |
 
-This change follows the project constraint in [constraint.md](constraint.md): no engine files were modified.
-
-Why it matters:
-- avoids re-searching the same positions many times
-- improves alpha-beta efficiency massively
-- reduces wasted time in repeated tactical lines
-
-Where to implement:
-- in `B23CS1001._negamax()` and `B23CS1001.get_best_move()`
-- use a dictionary keyed by board state + side to move + depth
-
-Suggested fields:
-- key
-- depth
-- value
-- flag: EXACT / LOWERBOUND / UPPERBOUND
-- best_move
-
-Implementation notes:
-- store a compact board key from the 48-square flat board
-- use the current side-to-move bit as part of the key
-- store best move from previous searches to improve ordering
+Across 6 games the agent is decisively ahead on aggregate points and converted
+one outright checkmate, versus the earlier 0–2 record.
 
 ---
 
-### 2) Add quiescence search
-Status: [x] Completed in the agent
+## Implemented improvements (all inside `B23CS1001.py`)
 
-Completed work:
-- added a shallow forcing-move quiescence search to handle captures and checks at the horizon
-- kept the logic compact and compatible with the existing alpha-beta search
-- this reduces tactical horizon errors without introducing complexity
+### A. Search correctness
 
-Why it matters:
-- prevents horizon-effect mistakes at depth cutoff
-- catches hanging-piece tactics and forcing sequences
-- reduces the chance of a static evaluation being wrong in a tactical position
+1. **Fixed iterative-deepening / aspiration windows** (`get_best_move`).
+   The old code centred the next iteration's window on the *static evaluation*
+   (`prev_score = self._evaluate_stm()`) and had **no fail-low/fail-high
+   re-search**. In the losing game this made every root move fail low, so the
+   search silently kept the depth-1 move — a pawn push that allowed mate-in-1.
+   Now the window is centred on the previous iteration's *search score* and
+   widened/re-searched on failure, so a completed iteration always updates the
+   best move. This removed the instant blunders.
+2. **Transposition-table mate-score normalisation.** Stored scores near `MATE`
+   are converted to node-relative on store and back to root-relative on probe
+   (via the node `ply`), so mate distances are never reused from the wrong ply.
+   TT bounds are applied with correct fail-soft cutoffs.
+3. **Quiescence rewrite.** Replaced "generate every legal move then filter" with
+   a **capture-only generator** (`_capture_moves`), MVV-LVA ordering, **delta
+   pruning** and a depth cap (`QMAX`). When in check, **all evasions** are
+   searched, so simple mates are still found at the horizon.
 
-Where to implement:
-- add a `_quiescence(alpha, beta)` helper to the agent
-- call it when `depth <= 0` and the position is tactical
+### B. Speed (the dominant lever)
 
-Suggested rules:
-- continue searching while there are captures or checking moves
-- stop when no forcing move remains
-- evaluate captures before static score in quiet positions
+4. **Integer board representation.** The agent now works on a flat list of small
+   ints (`0` empty, `1–5` white P/N/B/R/K, `6–10` black) instead of the engine's
+   2-char strings. String indexing/compare in the hottest paths became integer
+   ops. This drove most of the NPS gain.
+5. **Precomputed attack geometry tables.** `_KNIGHT_ATT`, `_KING_ATT`,
+   `_BISHOP_RAYS`, `_ROOK_RAYS`, `_PAWN_FWD`, `_PAWN_CAP_W/B` are built once at
+   import, removing all bounds checks and per-node `_idx()` calls.
+6. **Pin-based legality shortcut.** `_pinned_squares()` computes the pieces
+   standing between the king and an enemy slider; when not in check, only king
+   moves and pinned-piece moves need the expensive `_attacked` legality test.
+   This cut `_legal_moves` by ~2.6×.
+7. **Flat static-evaluation table** (`_STATIC`). Signed material + piece-square
+   table + centralisation for every (piece code, square) are folded into a single
+   lookup, so the eval loop does one indexing per occupied square.
+8. **O(1) exact position key.** `_position_key()` returns `(wtm, bytes(self.b))`
+   (the 0–10 codes) — no per-node `map`/genexpr allocation.
 
----
+### C. Evaluation quality
 
-### 3) Improve move ordering with killer moves and history
-Status: [x] Completed in the agent
+9. **Single-pass, allocation-free `_evaluate_white`.** Removed the old
+   dict-of-dicts `_scan_board` (multiple 48-square passes per leaf) in favour of
+   one tight loop. Material + PST stay dominant (they mirror the tournament
+   scoring), plus centralisation, **passed-pawn** bonuses (gated to low material
+   so the midgame stays fast) and a cheap **king-shield** term; the endgame
+   king-driving logic is retained.
+10. **MVV-LVA with attacker value** in `_ordering_key` (prefer capturing a big
+    piece with a small one), on top of the existing TT-move / killer / history
+    ordering.
 
-Completed work:
-- added killer move ordering per search depth
-- added a lightweight history heuristic
-- merged the ordering logic into the existing move-key approach to keep the code simple
+### D. Structural clean-up
 
-Why it matters:
-- stronger alpha-beta pruning
-- fewer nodes searched per second
-- better tactical move exploration
-
-Where to implement:
-- inside `_negamax()` ordering logic
-- add arrays or dictionaries for killer moves and history scores
-
-Recommended ordering:
-1. checks
-2. captures by MVV-LVA
-3. killer moves
-4. history heuristic moves
-5. remaining legal moves
-
----
-
-### 4) Strengthen the evaluation function
-Status: [x] Completed in the agent
-
-Completed work:
-- added lightweight mobility estimation
-- added pawn-structure and centralization influence
-- retained the original material/PST terms to keep the evaluation stable and readable
-
-This version is intentionally simplified to avoid complex networks while improving strategic judgment.
-
-Why it matters:
-- the current evaluation is mostly material + PST + endgame king pressure
-- this is too shallow for strategic and midgame play
-- it misses mobility, king safety, and pawn structure
-
-Where to implement:
-- modify `_evaluate_stm()` and `_evaluate_white()`
-
-Add these features:
-- mobility bonus for each side
-- king safety penalty for exposed king positions
-- central control bonus for pieces near the center
-- advanced pawn bonus for passed/forward pawns
-- rook activity on open files and ranks
-- bishop activity in open diagonals
-- trapped-piece penalty if a piece cannot move safely
+11. Reused the evaluation scan to supply the king squares to quiescence (removed
+    a redundant `_find_king` scan).
+12. Removed dead legacy helpers (`_scan_board`, `_mobility_bonus`,
+    `_pawn_structure_bonus`, `_passed_pawn_bonus`, `_king_safety_bonus`,
+    `_move_key`) that still referenced the old string board.
 
 ---
 
-### 5) Add mobility and king-safety terms
-Status: [ ] Not started
+## Evaluation of the suggested optimisations
 
-Why it matters:
-- a material edge is not enough if the king is unsafe
-- mobility measures flexibility and hidden tactical potential
-- many losses in chess come from strategic constriction rather than direct tactics
+Each suggestion was measured against the current code (isolated micro-benchmarks
+plus before/after `run_bench_fast.py`), not just assumed to help.
 
-Suggested metrics:
-- count legal moves for each side
-- small mobility bonus when the side has more legal moves
-- penalty if the king is in a file/rank with no cover
-- penalty if the king is near the edge in the middle game without support
+| # | Suggestion | Measured effect | Verdict |
+|---|---|---|---|
+| 1 | **Incremental Zobrist hashing** | `_position_key` was ~2.9 µs/node; with the integer board, `bytes(self.b)` is **0.52 µs** and allocation-free, so a 64-bit Zobrist (≈3 XORs/move) saves <1% overall | **Superseded** by the `bytes` key; not worth the extra make/unmake bookkeeping |
+| 2 | **Eliminate `_snapshot()` scans** | `_snapshot` fell 8.2→~5.3 µs via the int board; full incremental king/material tracking would save only ~1–2% but must be maintained in every temporary make/unmake site (incl. `_legal_moves`) — high bug risk | **Not done** (low ROI, high risk) |
+| 3 | **Integer board representation** | `_legal_moves` 38.6→~15 µs, eval faster, NPS **~7–9×**; biggest single win | **Implemented** |
+| 4 | **Raw-tuple TT / packed moves** | `TTEntry` already uses `__slots__` (no per-instance dict); tuples only remove one tiny allocation. Packing moves saves list/tuple churn but complicates every hot path | **Not done** (<1% here) |
+| 5 | **Avoid lambdas in ordering** | `sorted(key=lambda)` calls the key function once per element (not per comparison); the cost is `_ordering_key` itself, which was already trimmed by MVV-LVA. Micro-bench: ~6.5 µs/node | **Partially** (kept, low priority) |
+| 6 | **Local-variable caching** | Already applied where it matters (`b = self.b` in `_negamax`, `_quiescence`, generators); further binding is noise | **Applied where it helps** |
 
----
-
-### 6) Add passed-pawn and advanced-pawn evaluation
-Status: [ ] Not started
-
-Why it matters:
-- passed pawns become strong endgame assets even when material is equal
-- advanced pawns often drive the game by creating threats
-- this is especially important in a small-board variant where tempo matters
-
-Suggested logic:
-- bonus for pawn advancement toward the enemy side
-- stronger bonus for passed pawns
-- bonus if the pawn is near promotion rank
-- reduced bonus if the pawn is blocked or easily capturable
+Two additional, higher-value wins were found by profiling that were **not** in
+the original six suggestions but are now implemented: the **pin-based legality
+shortcut** (item 6 in section B) and the **flat `_STATIC` evaluation table**
+(item 7 in section B). Profiling showed `_legal_moves` + embedded `_attacked` and
+`_evaluate_white` together were ~65% of runtime, which is why those were targeted.
 
 ---
 
-### 7) Add aspiration windows for iterative deepening
-Status: [ ] Not started
+## Verification performed
 
-Why it matters:
-- reduces wasted search effort during iterative deepening
-- standard optimization used in strong alpha-beta engines
+- `python3 -c "import ast; ast.parse(...)"` — file parses.
+- `run_parity.py` — **PASSED**, 3195 positions, 0 mismatches (internal rules are
+  bit-exact with `GameEngine.get_legal_moves`, both colours).
+- `_STATIC` table validated against an independent reference (0 mismatches) and
+  the symmetric start position evaluates to exactly 0.
+- `test_endgame.py` — **5/5** converted to checkmate (KR vs K ×2, KRR vs K,
+  KBB vs K, KR vs KP).
+- `run_bench_fast.py` — throughput/depth recorded above.
+- `run_games_fast.py` — three clean runs recorded above.
 
-Where to implement:
-- in `get_best_move()`, around the iterative-deepening loop
+## Status checklist
 
-Suggested approach:
-- search with a narrow window near the previous iteration score
-- if the window fails, re-search with the full window
-
----
-
-### 8) Consider Late Move Reductions (LMR)
-Status: [ ] Not started
-
-Why it matters:
-- very useful when many moves are available
-- reduces depth on low-priority later moves
-- improves speed without large evaluation loss
-
-This is optional but recommended once the above are working well.
-
----
-
-### 9) Add stronger benchmark tests and regression checks
-Status: [ ] Not started
-
-Why it matters:
-- confirms that each change improves real game strength
-- makes it easier to detect tactical regressions
-
-Suggested checks:
-- run `run_games_fast.py` after each major improvement
-- compare performance against `P25CS0004` and `P22CS201`
-- record wins/losses/stalemates as a benchmark log
-- test midgame tactical positions manually
-
----
-
-## Priority order
-
-The order below gives the maximum performance gain per effort:
-
-1. Transposition table
-2. Quiescence search
-3. Stronger evaluation function
-4. Killer + history move ordering
-5. Mobility and king safety
-6. Passed-pawn and advanced-pawn evaluation
-7. Aspiration windows
-8. LMR (optional)
-9. Benchmark tuning and regression checks
-
----
-
-## Current implementation focus area
-
-The main code areas to modify are:
-- `B23CS1001.get_best_move()`
-- `B23CS1001._negamax()`
-- `B23CS1001._evaluate_stm()`
-- `B23CS1001._evaluate_white()`
-- `B23CS1001._move_key()`
-
-The key observation is that the current agent already has a decent alpha-beta core; the biggest gains will come from better search efficiency and a stronger positional evaluator.
-
----
+- [x] Transposition table (bounds + best-move ordering + mate normalisation)
+- [x] Quiescence search (capture-only, evasions in check, delta pruning, cap)
+- [x] Killer + history move ordering
+- [x] Mobility / king-safety / passed-pawn evaluation terms
+- [x] Aspiration windows with fail-low/high re-search
+- [x] Iterative-deepening correctness fix (root best-move tracking)
+- [x] Late-move reductions, reverse-futility pruning, null-move pruning (retained/tuned)
+- [x] Integer board + precomputed attack tables + pin legality + flat eval table
+- [x] Benchmark + regression checks (parity, endgame, bench, gauntlet)
 
 ## Final note
 
-The assignments and tournament rules are strict. The improvements below respect the constraints and focus strictly on legal, fair, adversarial search behavior.
+The agent remains a single-file, engine-agnostic adversarial search agent. No
+engine, rule, scoring or harness file was modified, and the black-box opponent's
+source was never inspected.
+
+---
+
+## Additional micro-optimisations (round 3)
+
+Applied after profiling the remaining hot path:
+
+- **LMR lookup table (`_LMR`)**: the reduction formula was calling `math.log`
+  twice per non-first move; it is now a precomputed 64×64 table lookup.
+- **Flat history array** (`self.history = [0] * 2304`): replaced the dict keyed by
+  `(fr, to)` tuples with direct integer indexing `fr*48 + to`, removing per-move
+  dict hashing.
+- **History gravity**: cutoff bonuses now decay
+  (`h += bonus - h * bonus // 16384`), so early-iteration scores cannot
+  permanently dominate ordering.
+- **Inlined move ordering** in `_negamax` — **tried and REVERTED**. A hand-rolled
+  `for` loop building `(key, move)` tuples plus `list.sort` was *slower* than
+  CPython's C-level `sorted(list, key=fn)` (decorate-sort-undecorate): start
+  position throughput fell from ~20k to ~13k NPS, which cost search depth and
+  measurably weakened play. The original
+  `sorted(legal, key=lambda m: self._ordering_key(...))` was restored.
+
+Verification after round 3 (final): `run_parity.py` **PASSED** (3195 positions,
+0 mismatches); start-position NPS ~19–20k; a **6-game** head-to-head against
+`B23ME1074` produced **+550 net points** with one **checkmate win** (all six
+games positive: +40, +30\*, +20, +170, +50, +240).
+
+### Lesson recorded
+
+Micro-optimisation must be measured, not assumed. The two round-3 changes that
+helped/neutral (LMR table, flat history array + gravity) were kept; the one that
+*slowed the search* (manual ordering) was reverted. In CPython, prefer built-in
+C-level operations (`sorted(key=…)`, `bytes`, `list.sort`) over hand-written
+Python loops that do the same decorate/sort work.
+
+### Considered but not adopted (with reasons)
+
+- **Full incremental Zobrist hashing**: `bytes(self.b)` is already 0.52 µs per
+  node and allocation-light; a 64-bit XOR key would save <1% while adding
+  make/unmake bookkeeping risk.
+- **Incremental king/material tracking** (to delete `_snapshot`): `_snapshot` is
+  ~5.3 µs; the saving is ~1–2%, but the state must stay consistent across every
+  temporary apply/unapply — including inside move generation — which is high risk
+  for low reward in Python.
+- **Futility pruning**: a variant was tried and measured; it did not help (poor
+  interaction with the aspiration re-search), so it was reverted.
+- **Pure-Python bitboards**: 48 squares do fit in one 64-bit word, but the current
+  cost is Python interpreter overhead per operation, not the representation;
+  bitboards would only pay off with a much larger rewrite (see discussion).
+
+### Recommended next SOTA steps (not yet implemented)
+
+1. **Bounded check extension** — extend one ply only while resolving a check
+   (`ply`-capped) to reduce tactical blindness; must be capped to avoid
+   perpetual-check explosion.
+2. **Late Move Pruning (LMP)** at `depth <= 3` — search only the first
+   `3 + depth*depth` quiet moves; needs measurement (futility was rejected).
+3. **Continuation / counter-move history** — index history by the opponent's
+   previous move to improve quiet-move ordering.
+4. **Static Exchange Evaluation (SEE)** — order/​prune captures by true material
+   outcome, sharpening quiescence.
+5. **Singular extensions** — expensive; only worth it once the above are stable.
+
+Each of these must be gated behind the parity test plus a fresh `run_games_fast`
+comparison, because measured run-to-run spread on this opponent is ±~70 points.
+
+

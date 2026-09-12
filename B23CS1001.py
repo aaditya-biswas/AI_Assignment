@@ -159,6 +159,13 @@ QMAX = 6                   # quiescence depth cap
 _PAWN_CAP_W_inv = _PAWN_CAP_B
 _PAWN_CAP_B_inv = _PAWN_CAP_W
 
+# Late-Move-Reduction lookup: R(d, i) = floor(1 + ln(d)*ln(i+1)/2) for d>2, i>2,
+# precomputed so the search never calls math.log.
+_LMR = [[0] * 64 for _ in range(64)]
+for _d in range(3, 64):
+    for _i in range(3, 64):
+        _LMR[_d][_i] = max(0, 1 + int(math.log(_d) * math.log(_i + 1) / 2.0))
+
 
 
 class _AbortSearch(Exception):
@@ -186,7 +193,7 @@ class B23CS1001:
         self.wtm = True
         self.tt = {}
         self.killers = {}
-        self.history = {}
+        self.history = [0] * (48 * 48)
         self.qnodes = 0
 
     # ------------------------------------------------------------- setup
@@ -332,7 +339,7 @@ class B23CS1001:
     def _lmr_reduction(self, depth, idx):
         if depth <= 2 or idx <= 2:
             return 0
-        return max(0, 1 + int(math.log(depth) * math.log(idx + 1) / 2.0))
+        return _LMR[depth if depth < 64 else 63][idx if idx < 64 else 63]
 
     def _null_move_allowed(self, in_check, depth):
         if in_check or depth < 2:
@@ -446,8 +453,11 @@ class B23CS1001:
 
         if best_move is not None:
             self._record_killer(depth, best_move)
-            self.history[best_move] = self.history.get(best_move, 0) \
-                + max(1, depth * depth)
+            hidx = best_move[0] * 48 + best_move[1]
+            hbonus = depth * depth
+            hval = self.history[hidx]
+            # Bounded ("gravity") update keeps early scores from dominating.
+            self.history[hidx] = hval + hbonus - hval * hbonus // 16384
         if best_score <= alpha_orig:
             flag = TT_UPPER
         elif best_score >= beta:
@@ -475,7 +485,7 @@ class B23CS1001:
         killers = self.killers.get(depth, ())
         if (fr, to) in killers:
             key -= 50000
-        key -= self.history.get((fr, to), 0)
+        key -= self.history[fr * 48 + to]
         return key
 
     def _record_killer(self, depth, move):
