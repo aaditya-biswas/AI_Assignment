@@ -153,6 +153,7 @@ for _r in range(BH):
 
 MATE_BOUND = MATE - 1000   # scores beyond this encode mate distances
 QMAX = 6                   # quiescence depth cap
+CHECK_EXT_CAP = 24         # ply cap for the bounded check extension
 
 # Inverse pawn tables: the squares a white/black pawn would have to stand on in
 # order to attack a given square (same geometry as the opposite pawn's captures).
@@ -194,6 +195,7 @@ class B23CS1001:
         self.tt = {}
         self.killers = {}
         self.history = [0] * (48 * 48)
+        self.counter = [-1] * (48 * 48)
         self.qnodes = 0
 
     # ------------------------------------------------------------- setup
@@ -349,7 +351,7 @@ class B23CS1001:
                 return True
         return False
 
-    def _negamax(self, depth, alpha, beta, ply):
+    def _negamax(self, depth, alpha, beta, ply, prev=-1):
         b = self.b
         self.nodes_expanded += 1
         self._search_nodes += 1
@@ -397,7 +399,8 @@ class B23CS1001:
                     return stand_pat
             if self._null_move_allowed(in_check, depth):
                 self.wtm = not self.wtm
-                score = -self._negamax(depth - 2, -beta, -beta + 1, ply + 1)
+                score = -self._negamax(depth - 2, -beta, -beta + 1, ply + 1,
+                                       -1)
                 self.wtm = not self.wtm
                 if score >= beta:
                     return beta
@@ -406,35 +409,56 @@ class B23CS1001:
         if not legal:
             return -(MATE - ply) if in_check else 0
 
+        # Ordering inputs are hoisted out of the per-move key function (the
+        # killer lookup and counter-move lookup used to run once per move).
+        killers = self.killers.get(depth, ())
+        k0 = killers[0] if killers else -1
+        k1 = killers[1] if len(killers) > 1 else -1
+        cm = self.counter[prev] if prev >= 0 else -1
+        if tt_move is not None:
+            tt_fr, tt_to = tt_move
+        else:
+            tt_fr = tt_to = -1
+        hist = self.history
         ordered = sorted(
             legal,
-            key=lambda m: self._ordering_key(m, drive, depth, tt_move),
+            key=lambda m: self._order_key(m, drive, b, tt_fr, tt_to,
+                                          k0, k1, cm, hist),
         )
 
         best_move = None
         alpha_orig = alpha
         best_score = -MATE
+        # Bounded check extension: resolve checks one ply deeper (ply-capped).
+        ext = 1 if (in_check and ply < CHECK_EXT_CAP) else 0
+        # Late move pruning: at shallow non-check nodes, drop late quiet moves.
+        lmp_limit = (3 + depth * depth) if (not in_check and depth <= 3) \
+            else 1000
         for idx, (fr, to, captured, gives) in enumerate(ordered):
+            if idx >= lmp_limit and captured == E and not gives:
+                continue
+            nmove = fr * 48 + to
             piece = b[fr]
             b[to] = piece
             b[fr] = E
             self.wtm = not self.wtm
             try:
                 if idx == 0:
-                    score = -self._negamax(depth - 1, -beta, -alpha, ply + 1)
+                    score = -self._negamax(depth - 1 + ext, -beta, -alpha,
+                                           ply + 1, nmove)
                 else:
-                    search_depth = depth - 1
+                    search_depth = depth - 1 + ext
                     if depth >= 3 and captured == E and not gives \
                             and not in_check:
                         search_depth -= self._lmr_reduction(depth, idx)
                     if search_depth < 0:
                         search_depth = 0
                     score = -self._negamax(search_depth, -alpha - 1, -alpha,
-                                           ply + 1)
+                                           ply + 1, nmove)
                     if score > alpha and score < beta:
                         # PVS re-search with the full window.
-                        score = -self._negamax(depth - 1, -beta, -alpha,
-                                               ply + 1)
+                        score = -self._negamax(depth - 1 + ext, -beta, -alpha,
+                                               ply + 1, nmove)
             except _AbortSearch:
                 b[fr] = piece
                 b[to] = captured
@@ -452,12 +476,15 @@ class B23CS1001:
                 break
 
         if best_move is not None:
+            bmove = best_move[0] * 48 + best_move[1]
             self._record_killer(depth, best_move)
-            hidx = best_move[0] * 48 + best_move[1]
+            if prev >= 0 and best_score >= beta:
+                # Counter-move: remember this reply to the opponent's move.
+                self.counter[prev] = bmove
             hbonus = depth * depth
-            hval = self.history[hidx]
+            hval = self.history[bmove]
             # Bounded ("gravity") update keeps early scores from dominating.
-            self.history[hidx] = hval + hbonus - hval * hbonus // 16384
+            self.history[bmove] = hval + hbonus - hval * hbonus // 16384
         if best_score <= alpha_orig:
             flag = TT_UPPER
         elif best_score >= beta:
@@ -474,6 +501,7 @@ class B23CS1001:
 
     def _ordering_key(self, move, drive, depth, tt_move=None):
         fr, to, captured, gives = move
+        ht = fr * 48 + to
         key = 0
         if tt_move is not None and (fr, to) == tt_move:
             key -= 10**9
@@ -482,20 +510,39 @@ class B23CS1001:
         if captured:
             key -= 100000 + _PTVAL[_TYPE[captured]] * 100 \
                 - _PTVAL[_TYPE[self.b[fr]]]
-        killers = self.killers.get(depth, ())
-        if (fr, to) in killers:
+        if ht in self.killers.get(depth, ()):
             key -= 50000
-        key -= self.history[fr * 48 + to]
+        key -= self.history[ht]
+        return key
+
+    def _order_key(self, move, drive, b, tt_fr, tt_to, k0, k1, cm, hist):
+        """Hot ordering key with all lookups pre-resolved by the caller
+        (TT move, killers, counter-move and history are passed in)."""
+        fr, to, captured, gives = move
+        key = 0
+        if fr == tt_fr and to == tt_to:
+            key -= 10 ** 9
+        if drive and gives:
+            key -= 300000
+        if captured:
+            key -= 100000 + _PTVAL[_TYPE[captured]] * 100 \
+                - _PTVAL[_TYPE[b[fr]]]
+        ht = fr * 48 + to
+        if ht == k0 or ht == k1:
+            key -= 50000
+        elif ht == cm:
+            key -= 45000
+        key -= hist[ht]
         return key
 
     def _record_killer(self, depth, move):
         if move is None:
             return
-        fr, to = move
+        fm = move[0] * 48 + move[1]
         lst = self.killers.setdefault(depth, [])
-        if (fr, to) in lst:
+        if fm in lst:
             return
-        lst.insert(0, (fr, to))
+        lst.insert(0, fm)
         if len(lst) > 2:
             lst.pop()
 
