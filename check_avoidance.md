@@ -188,3 +188,69 @@ deeper search is free to overrule the heuristic whenever a mate appears.
 5. Only if that is not enough, add Option B behind the gating, or Option C's
    evasion ordering.
 
+---
+
+## 6. Implementation status (Option A — done, in the working tree)
+
+### 6.1 What was added to `B23CS1001.py`
+
+| Piece | Detail |
+|---|---|
+| `_WT` | attacker weight per piece code: pawn 1, knight/bishop 2, rook 3, king 0 |
+| `_PROX_RANGE = 3`, `_PROX` | 48x48 table: weight `4 - Chebyshev distance` for pieces within 3 squares of the king, else 0 |
+| `self._press_w` / `self._press_b` | running enemy pressure around the white / black king |
+| `_pressure_on(ksq, by_white)` | from-scratch computation (initialisation + king moves + the test) |
+| `_press_add(code, sq, sign)` | O(1) add/remove of one piece's contribution, short-circuited when the square is out of range |
+| `_eval_add` / `_eval_sub` | maintain both accumulators on every make/unmake; a king move triggers a full recompute of its own accumulator |
+| `_evaluate_white` | `score += clamp(_press_b - _press_w, +/- PRESS_CAP) * PRESS_SCALE`, each side counted only while it still has >= 2 non-king pieces |
+| `PRESS_SCALE = 1`, `PRESS_CAP = 30` | the tuning knobs; `PRESS_CAP` (30 = 1.5 pawns) keeps the term strictly below material, and a mate (~MATE) always overrules it |
+
+### 6.2 A real bug, caught by the new regression test
+
+The first version attributed a **captured** piece's pressure to the king of *its
+own* colour. That is wrong: a piece exerts pressure on the **enemy** king, so a
+captured white piece must be removed from `_press_b`. The verifier reported it on
+the very first disagreement (a black bishop taking a pawn):
+
+```
+ADD MISMATCH after piece=8 5->30 cap=1
+   got (1, 0)   want (2, 0)   wk/bk=45/3
+   call #94
+```
+
+Fixed by routing captured pieces through the same `_press_add` (with the king
+squares still un-moved, so the removal is exact; a king capture is then covered by
+the full recompute). This is exactly the silent-corruption class that would have
+poisoned every score without any parity failure — which is why
+`test_incremental.py` now exists in the repo.
+
+### 6.3 Validation (all green)
+
+| Check | Result |
+|---|---|
+| `python3 -m py_compile B23CS1001.py` | OK |
+| per-call verifier (completed **and** aborted searches) | OK — 798 calls each |
+| `test_incremental.py` (4 full games, 160 searches) | **PASSED** — incremental state == from-scratch, and the internal board == engine board |
+| `smoke_test.py` | **PASSED** |
+
+### 6.4 Measured cost
+
+Fixed-depth-7 search, CPU time, alternating the two builds (committed `dcf8990`
+vs current), median of 5 runs each:
+
+| Build | NPS |
+|---|---|
+| without king pressure | 71,719 |
+| **with king pressure** | **65,954** |
+| ratio | **0.92** (about 8 % => about 0.1 ply) |
+
+So the term costs roughly a tenth of a ply. Whether that is a good trade is a
+*measurement question*, and the metric to watch is **checks conceded per game**
+(and the mate count), not the raw score:
+
+1. run the gauntlet and read the `chk` column from our side;
+2. if the conceded checks fall materially and the mate count does not rise, keep
+   it and raise `PRESS_SCALE` (the current value is conservative);
+3. if not, set `PRESS_SCALE = 0` (the machinery then costs nothing measurable and
+   can stay in place), or revert.
+

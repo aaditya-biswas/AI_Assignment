@@ -307,31 +307,9 @@ class B23CS1001:
                 if ek >= 0:
                     self._press_w += sign * w * _PROX[ek][sq]
 
-    def _press_captured(self, code, sq, sign):
-        """Add/remove a captured piece's pressure on the king of its own colour."""
-        w = _WT[code]
-        if w:
-            if code < 6:
-                ck = self._wk
-                if ck >= 0:
-                    self._press_w += sign * w * _PROX[ck][sq]
-            else:
-                ck = self._bk
-                if ck >= 0:
-                    self._press_b += sign * w * _PROX[ck][sq]
-
     def _eval_add(self, piece, fr, to, captured):
         """Incremental evaluation update when `piece` moves fr -> to."""
         self._static += _STATIC[piece][to] - _STATIC[piece][fr]
-        king_moved = piece == WK or piece == BK
-        if piece == WK:
-            self._wk = to
-        elif piece == BK:
-            self._bk = to
-        else:
-            # The mover carries its king pressure along with it.
-            self._press_add(piece, to, 1)
-            self._press_add(piece, fr, -1)
         if captured:
             self._static -= _STATIC[captured][to]
             if captured < 6:
@@ -340,25 +318,29 @@ class B23CS1001:
             else:
                 self.bnk -= 1
                 self.bpow -= _VAL[captured]
-            self._press_captured(captured, to, -1)
-        if king_moved:
-            # Every enemy piece's proximity changes when a king moves.
-            if piece == WK:
-                self._press_w = self._pressure_on(to, False)
-            else:
-                self._press_b = self._pressure_on(to, True)
+            # A captured piece stops exerting its own pressure on the ENEMY
+            # king (the king squares have not moved yet, so this is exact).
+            cek = self._bk if captured < 6 else self._wk
+            if cek >= 0 and _PROX[cek][to]:
+                self._press_add(captured, to, -1)
+        if piece == WK:
+            self._wk = to
+            self._press_w = self._pressure_on(to, False)
+        elif piece == BK:
+            self._bk = to
+            self._press_b = self._pressure_on(to, True)
+        else:
+            # The mover carries its king pressure along with it.  Most moves are
+            # far from the enemy king, where both lookups are 0 and the whole
+            # update is a no-op, so it is skipped.
+            ek = self._bk if piece < 6 else self._wk
+            if ek >= 0 and (_PROX[ek][to] or _PROX[ek][fr]):
+                self._press_add(piece, to, 1)
+                self._press_add(piece, fr, -1)
 
     def _eval_sub(self, piece, fr, to, captured):
         """Reverse of _eval_add (undo a move)."""
         self._static -= _STATIC[piece][to] - _STATIC[piece][fr]
-        king_moved = piece == WK or piece == BK
-        if piece == WK:
-            self._wk = fr
-        elif piece == BK:
-            self._bk = fr
-        else:
-            self._press_add(piece, to, -1)
-            self._press_add(piece, fr, 1)
         if captured:
             self._static += _STATIC[captured][to]
             if captured < 6:
@@ -367,12 +349,20 @@ class B23CS1001:
             else:
                 self.bnk += 1
                 self.bpow += _VAL[captured]
-            self._press_captured(captured, to, 1)
-        if king_moved:
-            if piece == WK:
-                self._press_w = self._pressure_on(fr, False)
-            else:
-                self._press_b = self._pressure_on(fr, True)
+            cek = self._bk if captured < 6 else self._wk
+            if cek >= 0 and _PROX[cek][to]:
+                self._press_add(captured, to, 1)
+        if piece == WK:
+            self._wk = fr
+            self._press_w = self._pressure_on(fr, False)
+        elif piece == BK:
+            self._bk = fr
+            self._press_b = self._pressure_on(fr, True)
+        else:
+            ek = self._bk if piece < 6 else self._wk
+            if ek >= 0 and (_PROX[ek][to] or _PROX[ek][fr]):
+                self._press_add(piece, to, -1)
+                self._press_add(piece, fr, 1)
 
     def _position_key(self):
         # Each square is a 0..10 code, so bytes() is a very fast exact key.
