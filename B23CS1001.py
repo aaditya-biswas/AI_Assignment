@@ -6,33 +6,19 @@ import math
 import time
 
 from config import (
-    BOARD_WIDTH as BW, BOARD_HEIGHT as BH, EMPTY_SQUARE as ES,
-    PIECE_VALUES, KING_PST_LATE_GAME,
+    BOARD_WIDTH as BW, BOARD_HEIGHT as BH,
+    KING_PST_LATE_GAME,
     PAWN_PST, KNIGHT_PST, BISHOP_PST, ROOK_PST,
 )
-from board import Move
 
 
 MATE = 100000            # scores for mates exceed any material total
 FEW_PIECE_LIMIT = 9      # at/below this many pieces: cheap terminal check
 KING_PST = KING_PST_LATE_GAME
-PST = {'P': PAWN_PST, 'N': KNIGHT_PST, 'B': BISHOP_PST, 'R': ROOK_PST}
-
-# Move-ordering value of each piece type (capture "victim" weight).
-PT_VAL = {'P': 20, 'N': 70, 'B': 70, 'R': 100, 'K': 0}
 
 TT_EXACT = 0
 TT_LOWER = 1
 TT_UPPER = 2
-
-_PIECE_CODES = {
-    '--': 0,
-    'wP': 1, 'bP': 2,
-    'wN': 3, 'bN': 4,
-    'wB': 5, 'bB': 6,
-    'wR': 7, 'bR': 8,
-    'wK': 9, 'bK': 10,
-}
 
 # ------------------------------------------------------------------ int board
 # Internally the agent works on a flat list of small ints instead of the

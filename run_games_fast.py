@@ -5,11 +5,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from board import GameEngine, Move          # noqa: E402
+from board import GameEngine                # noqa: E402
 from config import EMPTY_SQUARE, PIECE_VALUES  # noqa: E402
 from B23CS1001 import B23CS1001             # noqa: E402
-from p22cs201 import P22CS201               # noqa: E402
-from p25cs0004 import P25CS0004             # noqa: E402
 from B23ME1074 import B23ME1074             # noqa: E402
 from B23ES1030 import B23ES1030             # noqa: E402
 CAP = 150
