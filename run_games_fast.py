@@ -5,6 +5,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from AIPlayer import AIPlayer
 from board import GameEngine                # noqa: E402
 from config import EMPTY_SQUARE, PIECE_VALUES  # noqa: E402
 from B23CS1001 import B23CS1001             # noqa: E402
@@ -92,7 +93,7 @@ def play(white_cls, black_cls):
 
 def main():
     for pair in [
-                 (B23CS1001, B23ES1030), (B23ES1030, B23CS1001), (B23CS1001, B23ME1074),
+                 (B23CS1001, AIPlayer), (AIPlayer, B23CS1001), (B23CS1001, B23ME1074),
                  (B23ME1074, B23CS1001), ]:
         play(*pair)
     print("FAST GAUNTLET DONE", flush=True)
