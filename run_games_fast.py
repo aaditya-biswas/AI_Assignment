@@ -3,7 +3,6 @@ import os
 import sys
 import time
 
-from B23ES10301 import B23ES10301
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -13,7 +12,6 @@ from config import EMPTY_SQUARE, PIECE_VALUES  # noqa: E402
 from B23CS1001 import B23CS1001             # noqa: E402
 from B23ME1074 import B23ME1074             # noqa: E402
 from B23ES1030 import B23ES1030      
-from B23ES10301 import B23ES10301      # noqa: E402
 CAP = 150
 PLAYER_LIMIT = 60.0       # strict 1-minute clock per player; running out = loss
 
@@ -96,7 +94,7 @@ def play(white_cls, black_cls):
 
 def main():
     for pair in [
-                 (B23CS1001, B23ME1074), (B23ME1074, B23CS1001),]:
+                 (B23ME1074, B23CS1001), (B23CS1001, B23ME1074),]:
         play(*pair)
     print("FAST GAUNTLET DONE", flush=True)
 

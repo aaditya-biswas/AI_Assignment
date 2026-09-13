@@ -256,21 +256,22 @@ class B23CS1001:
     # --- check-avoidance (king pressure) evaluation ------------------------
     PRESS_SCALE = 1                # weight of the king-pressure difference
     PRESS_CAP = 30                 # hard cap (1.5 pawns): never beats material
-    # The official scorecard pays +2 for every check GIVEN, and against ME1074
-    # that has been worth 34-58 checks (68-116 points) in a single game - more
-    # than a rook - so a position whose side to move is in check is priced
-    # accordingly inside the search.  Being node-level it cannot be forgotten
-    # between depths, the sign is symmetric (our own checks gain the same value),
-    # and the transposition table stays consistent because the penalty is a pure
-    # function of the position.
-    CHECK_PTS = 2                  # scorecard value of the check that led here
-    # The scorecard pays the OPPONENT +2 for every check it lands, and against a
-    # piece-active opponent that has been worth 60-116 points in a single game -
-    # more than a rook.  ROOT_CHECK_W taxes, per root move, how many checking
-    # replies it leaves available (measured once per move, capped so it can never
-    # outbid real material).
+    # Check defence.  Pricing checks inside the search was implemented and
+    # REJECTED by measurement: negamax makes the term symmetric, so it also pays
+    # US for giving check, and that trades material for 2-point checks -
+    # interleaved games at 2-4 points lost with material -160 to -400 (mated in
+    # 62-77 plies), against -120/+100 with it disabled.  A bounded asymmetric
+    # root tax on the checking replies we leave (ROOT_CHECK_W = 4) was also
+    # measured and rejected: it does kill the check column (mean check diff
+    # -81 -> -1.5 over 8 interleaved games) but it pays for that by ducking -
+    # material +97.5 -> -27.5, official +16.5 -> -7.0, i.e. a net loss.
+    # What is left is the one trade that costs nothing: exchanging off the
+    # opponent's long-range pieces when we are ahead on points, since an
+    # exchange is material neutral and each rook/bishop removed is a check
+    # source (and a mate threat) removed with it.
     ROOT_CHECK_W = 0               # score tax per checking reply left available
     ROOT_CHECK_CAP = 4             # ... capped at this many replies
+    ADJ_TRADE_W = 0                # bonus for an exchange while ahead on points
     # --- adjudication scorecard (the tournament's points table) ------------
     # The official scoring is captures at PIECE_VALUES (P20 N70 B70 R100) plus
     # 2 points for every check GIVEN, a mate is 600 and overrides that table,
@@ -721,6 +722,12 @@ class B23CS1001:
                             if th > self.ROOT_CHECK_CAP:
                                 th = self.ROOT_CHECK_CAP
                             score -= th * self.ROOT_CHECK_W
+                        if self.ADJ_TRADE_W and self._adj_mode > 0 \
+                                and captured != E and _TYPE[captured] in (3, 4):
+                            # Ahead on points, late: an exchange costs no
+                            # material and removes a rook or bishop, i.e. one of
+                            # the pieces that farm +2 checks and mate threats.
+                            score += self.ADJ_TRADE_W
                         if score > cur_score:
                             cur_score = score
                         if score > alpha:
@@ -1007,11 +1014,6 @@ class B23CS1001:
             hval = self.history[bmove]
             # Bounded ("gravity") update keeps early scores from dominating.
             self.history[bmove] = hval + hbonus - hval * hbonus // 16384
-        if self.CHECK_PTS and in_check:
-            # The check that led to this position is worth +2 to the opponent,
-            # so this node's value is that much lower for us.  Applied before the
-            # flag so the value stored in the transposition table carries it too.
-            best_score -= self.CHECK_PTS
         if best_score <= alpha_orig:
             flag = TT_UPPER
         elif best_score >= beta:
@@ -1168,15 +1170,13 @@ class B23CS1001:
         myk = self._wk if my_white else self._bk
         in_check = myk >= 0 and self._attacked(myk, opp)
         stand_pat = self._evaluate_stm()
-        if self.CHECK_PTS and in_check:
-            stand_pat -= self.CHECK_PTS     # being in check costs the scorecard 2
 
         if in_check:
             legal = self._legal_moves(myk, False, -1, True)
             if not legal:
                 return -(MATE - 1)
             if qdepth >= QMAX:
-                return self._evaluate_stm() - self.CHECK_PTS
+                return self._evaluate_stm()
             legal.sort(key=lambda m: self._ordering_key(m, False, 0))
             for fr, to, captured, gives in legal:
                 piece = b[fr]
@@ -1199,10 +1199,8 @@ class B23CS1001:
                 if score > alpha:
                     alpha = score
                 if alpha >= beta:
-                    # The check that led to this position is still worth +2 to
-                    # the opponent, so the node's value carries that penalty.
-                    return alpha - self.CHECK_PTS
-            return alpha - self.CHECK_PTS
+                    return alpha
+            return alpha
 
         if stand_pat >= beta:
             return stand_pat

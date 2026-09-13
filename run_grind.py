@@ -161,13 +161,14 @@ def _summary(rows, opponent=None):
 def print_summary(s):
     if s is None:
         return
-    print(f"  {s['name']:<12} {s['games']:>2} games  "
-          f"W-L-D {s['wins']}-{s['losses']}-{s['draws']}  "
-          f"| official us {s['pts_us']:6.1f} them {s['pts_them']:6.1f} "
-          f"diff {s['diff']:+7.1f}"
+    print(f"  vs {s['name']:<12} {s['games']:>2} games   WE went "
+          f"{s['wins']}W-{s['losses']}L-{s['draws']}D"
+          f"\n               official points  ours {s['pts_us']:6.1f}  "
+          f"theirs {s['pts_them']:6.1f}   ours-minus-theirs "
+          f"{s['diff']:+7.1f}  (positive = we scored more)"
           f"\n               material diff {s['caps_diff']:+6.1f}   "
           f"check diff {s['chk_diff']:+5.1f}   "
-          f"mates {s['mate_for']}-{s['mate_against']}   "
+          f"mates {s['mate_for']}-{s['mate_against']} (ours-theirs)   "
           f"timeouts {s['timeouts']}   adjudicated {s['adjudicated']}"
           f"\n               mean plies {s['ply']:5.1f}   our clock "
           f"mean {s['clock_us']:5.1f}s max {s['clock_max']:5.1f}s "
@@ -226,14 +227,15 @@ def main():
                      f"{', budget ' + str(budget) + 's/move' if budget else ''}"
                      f")\n\n")
             for s in lines + [total]:
-                fh.write(f"- {s['name']}: {s['games']} games W-L-D "
-                         f"{s['wins']}-{s['losses']}-{s['draws']}, official "
-                         f"diff {s['diff']:+.1f}, material diff "
+                fh.write(f"- vs {s['name']}: we went {s['wins']}W-"
+                         f"{s['losses']}L-{s['draws']}D, official diff "
+                         f"{s['diff']:+.1f} (ours minus theirs, positive = in "
+                         f"our favour), material diff "
                          f"{s['caps_diff']:+.1f}, checks diff "
                          f"{s['chk_diff']:+.1f}, mates {s['mate_for']}-"
-                         f"{s['mate_against']}, timeouts {s['timeouts']}, "
-                         f"mean plies {s['ply']:.1f}, our clock max "
-                         f"{s['clock_max']:.1f}s\n")
+                         f"{s['mate_against']} (ours-theirs), timeouts "
+                         f"{s['timeouts']}, mean plies {s['ply']:.1f}, our "
+                         f"clock max {s['clock_max']:.1f}s\n")
         print(f"appended to grind_results.md under tag {tag!r}")
     return 0
 
