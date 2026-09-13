@@ -160,6 +160,40 @@ def _idx(r, c):
 class B23CS1001:
     """Alpha-beta agent (fast internal rules copy). Class name = roll number."""
 
+    # ------------------------------------------- time control (self-contained)
+    # Everything the agent needs to budget its own clock lives in THIS file, so
+    # the submission is a genuine single file: the official runner only has to
+    # construct it and call get_best_move().  The tournament gives each player
+    # 1 minute for the whole game (sudden death, no increment) and running out
+    # of time LOSES, so the allocator always keeps a reserve back.
+    #
+    # Scheme (after the usual engine practice: a soft bound the search aims to
+    # finish within, and a hard bound it may extend to when the position turns
+    # out to be unstable - "panic time"):
+    #   soft = remaining/moves_left * TIME_FRACTION * criticality
+    #   hard = min(soft * HARD_FACTOR, spendable, remaining*MAX_SHARE_CRIT)
+    GAME_SECONDS = 60.0            # 1-minute clock per player
+    ASSUMED_MOVES = 75             # assumed total game length for the spread
+    MIN_MOVES_LEFT = 8             # divisor floor for the spread
+    TIME_FRACTION = 0.75           # share of the clock the game may consume
+    MIN_MOVE_SECONDS = 0.15        # never move instantly
+    HARD_FACTOR = 2.5              # hard bound = soft * this
+    MAX_SHARE = 0.25               # one move never takes >25% of the clock
+    MAX_SHARE_CRIT = 0.35          # ... nor >35% even in a critical spot
+    RESERVE_SECONDS = 2.0          # always keep this much back (timeout = loss)
+    ITER_PREDICT = 2.5             # projected cost of the next iteration
+    # --- dynamic factors: positional advantage / criticality ---------------
+    DRIVE_MULT = 3.0               # we can force mate: +600, the dominant term
+    CHECK_MULT = 1.5               # in check: find the escape or lose the king
+    FEW_MULT = 1.2                 # endgame: precision matters
+    WIDE_ROOT = 25                 # this many legal moves = harder choice
+    WIDE_MULT = 1.1
+    PANIC_DROP = 100               # score fell this much -> think harder
+    PANIC_MULT = 1.5
+    EASY_STABILITY = 3             # same best move for N moves with a steady
+    EASY_DROP = 30                 # score -> the move is obvious, spend less
+    EASY_MULT = 0.5
+
     def __init__(self, engine, depth=6, max_depth=12):
         self.engine = engine
         self.nodes_expanded = 0
@@ -169,12 +203,16 @@ class B23CS1001:
         self.test_budget = None
         self.max_ply = 60
         self._deadline = None
+        self._soft_deadline = None
         self.b = None
         self.wtm = True
         self.tt = {}
         self.killers = {}
         self.history = [0] * (48 * 48)
         self.qnodes = 0
+        # Cross-move search history driving the dynamic time control.
+        self._last_stability = 0      # consecutive moves with an unchanged best
+        self._last_drop = 0           # score drop over the previous move
 
     # ------------------------------------------------------------- setup
     def _load(self):
@@ -257,30 +295,41 @@ class B23CS1001:
             return None
 
         t0 = time.monotonic()
-        moves_done = (len(engine.move_log) + 1) // 2
-        budget = (60.0 - self.time_used) * 0.45 / max(1, 75 - moves_done)
-        budget = max(0.25, min(budget, 2.5))
+        # A forced move needs no search at all.
+        if len(root) == 1:
+            self.time_used += time.monotonic() - t0
+            return root[0]
 
-        # Mate-drive detection: we lead by >= a rook and the opponent has no
-        # real pieces left.  When driving for mate we may use a little more of
-        # the clock and must search deeper.
+        moves_done = (len(engine.move_log) + 1) // 2
         myk, opk, in_check, few, drive = self._snapshot()
-        if drive:
-            budget = max(budget, min(2.0,
-                         (60.0 - self.time_used) * 0.55 /
-                         max(1, 75 - moves_done)))
+        # Dynamic time control: (soft, hard) seconds for this move, derived from
+        # the clock, the game phase and how critical the position is.
+        soft, hard = self._plan_time(moves_done, in_check, drive, few, len(root))
         if self.test_budget is not None:
-            budget = self.test_budget
-        deadline = t0 + budget
-        self._deadline = deadline
+            soft = hard = self.test_budget     # test-harness override only
+        soft_limit = t0 + soft
+        hard_limit = t0 + hard
+        self._deadline = hard_limit
+        self._soft_deadline = soft_limit
 
         best = None
         prev_score = None
+        changes = 0            # root best-move changes during this move
+        drop = 0               # score fall over the last iteration
+        iter_secs = 0.0        # duration of the last completed iteration
+        limit = soft_limit     # raised to hard_limit while the move is unstable
         cap = self.max_depth + (10 if drive else 8 if few else 0)
         try:
             for d in range(1, cap + 1):
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if now >= hard_limit:
                     break
+                # Do not start an iteration that cannot finish in the budget.
+                if best is not None and \
+                        now + iter_secs * self.ITER_PREDICT > limit:
+                    break
+                it0 = now
+                score_before = prev_score
                 if best is not None:
                     bt = (best.start_row, best.start_col,
                           best.end_row, best.end_col)
@@ -348,12 +397,77 @@ class B23CS1001:
                     prev_score = cur_score
                     break
                 self.depth = d
+                iter_secs = time.monotonic() - it0
+                new_key = ((best.start_row, best.start_col, best.end_row,
+                            best.end_col) if best is not None else None)
+                if bt is not None and new_key != bt:
+                    changes += 1
+                    limit = hard_limit          # unstable move -> panic time
+                if score_before is not None:
+                    drop = max(0, score_before - cur_score)
+                    if drop >= self.PANIC_DROP:
+                        limit = hard_limit
+                # A forced mate for us is already the best possible outcome.
+                if cur_score > MATE_BOUND:
+                    break
         except _AbortSearch:
             pass
         finally:
             self._deadline = None
+            self._soft_deadline = None
             self.time_used += time.monotonic() - t0
+            self._last_drop = drop
+            # An unchanged root move over consecutive moves = "easy move".
+            if changes == 0 and best is not None:
+                self._last_stability += 1
+            else:
+                self._last_stability = 0
         return best if best is not None else root[0]
+
+    def _plan_time(self, moves_done, in_check, drive, few, n_root):
+        """Return (soft, hard) seconds for this move - the dynamic time control.
+
+        Sudden death on a 60 s clock: the remaining time is spread over the moves
+        still expected, then scaled by how critical the position looks.  The
+        multipliers encode what this variant rewards - a mate is worth 600, so
+        mate-critical positions (we are driving for mate, or we are in check) get
+        by far the most time, while a position whose best move has not changed
+        for several plies and whose score is steady is treated as obvious and
+        gets less.  `hard` is the ceiling the search may extend to when the root
+        move keeps changing or the score drops (panic time); it is capped so no
+        single move can eat the clock, because running out of time LOSES.
+        """
+        remaining = max(0.05, self.GAME_SECONDS - self.time_used)
+        moves_left = max(self.MIN_MOVES_LEFT, self.ASSUMED_MOVES - moves_done)
+        base = remaining * self.TIME_FRACTION / moves_left
+
+        mult = 1.0
+        if drive:
+            mult *= self.DRIVE_MULT        # a finishable mate is +600
+        elif in_check:
+            mult *= self.CHECK_MULT        # must find the escape
+        if few:
+            mult *= self.FEW_MULT          # endgame precision
+        if n_root >= self.WIDE_ROOT:
+            mult *= self.WIDE_MULT         # many options = harder decision
+        if self._last_drop >= self.PANIC_DROP:
+            mult *= self.PANIC_MULT        # the score just fell: trouble
+        elif (self._last_stability >= self.EASY_STABILITY and
+                self._last_drop <= self.EASY_DROP):
+            mult *= self.EASY_MULT         # obvious and stable: move along
+
+        reserve = min(self.RESERVE_SECONDS, remaining * 0.5)
+        # The floor must scale with the clock, otherwise a fixed minimum would
+        # spend more than half of what is left in a near-empty clock and could
+        # lose on time.  Together with MAX_SHARE_CRIT this guarantees that no
+        # move ever takes more than half of the remaining time.
+        floor = min(self.MIN_MOVE_SECONDS, remaining * 0.1)
+        spendable = max(floor, remaining - reserve)
+        soft = max(floor, min(base * mult, spendable,
+                              remaining * self.MAX_SHARE))
+        hard = max(soft, min(soft * self.HARD_FACTOR, spendable,
+                             remaining * self.MAX_SHARE_CRIT))
+        return soft, hard
 
     def _root_key(self, mv, drive, myk, opk):
         """Root move ordering: in mate-drive prefer checks, then captures."""
@@ -1024,6 +1138,15 @@ class B23CS1001:
         elif b_pow - w_pow >= 100 and w_nk <= 1 and w_king >= 0 \
                 and b_king >= 0:
             score -= self._drive_bonus('b', b_king, w_king)
+        # Defensive drive: the case the bonus above does *not* cover, i.e. the
+        # trailing side still has two or more non-king pieces.  Losing a king is
+        # worth 600, so a boxed-in king is penalised well before the endgame has
+        # been stripped down to a bare king.
+        if w_king >= 0 and b_king >= 0:
+            if b_pow - w_pow >= 100 and w_nk >= 2:
+                score -= self._king_danger(w_king, 'b')
+            elif w_pow - b_pow >= 100 and b_nk >= 2:
+                score += self._king_danger(b_king, 'w')
         # Expose the king squares so quiescence does not need a second scan.
         self._wk = w_king
         self._bk = b_king
@@ -1060,6 +1183,46 @@ class B23CS1001:
                 if rr == er or rc == ec:
                     cuts += 1
         score += 40 * cuts
+        return score
+
+    def _king_danger(self, ksq, opp):
+        """How endangered a king is while `opp` is the side with mating material.
+
+        Defensive counterpart of `_drive_bonus`: only *defensive* facts are
+        scored (edge proximity, escape squares, cut-off enemy rooks), because the
+        attacker's incentives (bring my king near, cut with rooks) are already
+        supplied by `_drive_bonus`.  The escape-square count is the part that
+        catches a mate that is one tempo away; it is only paid for near an edge,
+        where being boxed in can actually matter.
+        """
+        b = self.b
+        kr, kc = divmod(ksq, BW)
+        rowd = min(kr, BH - 1 - kr)
+        cold = min(kc, BW - 1 - kc)
+        score = 0
+        if rowd == 0 and cold == 0:          # trapped in a corner
+            score += 60
+        elif rowd == 0 or cold == 0:         # on an edge
+            score += 30
+        elif rowd <= 1 and cold <= 1:
+            score += 10
+        if rowd <= 1 or cold <= 1:
+            escapes = 0
+            for t in _KING_ATT[ksq]:
+                if b[t] == E and not self._attacked(t, opp):
+                    escapes += 1
+            if escapes == 0:                 # every flight square is covered
+                score += 200
+            elif escapes == 1:
+                score += 60
+        rook = BR if opp == 'b' else WR
+        for ray in _ROOK_RAYS[ksq]:
+            for t in ray:
+                p = b[t]
+                if p:
+                    if p == rook:            # rook cuts the king's rank/file
+                        score += 45
+                    break
         return score
 
     def evaluate_board(self, game_state="ongoing"):
