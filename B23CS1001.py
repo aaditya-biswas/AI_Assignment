@@ -49,6 +49,25 @@ _VAL = (0, 20, 70, 70, 100, 600, 20, 70, 70, 100, 600)
 _VAL_SIGN = (0, 20, 70, 70, 100, 600, -20, -70, -70, -100, -600)
 _PTVAL = (0, 20, 70, 70, 100, 0)            # by type index (king -> 0)
 
+# ------------------------------------------------------- king pressure (checks)
+# "Check avoidance" evaluation: enemy pieces hanging around our king are what
+# produce the endless stream of +2 checks (and eventually mates), so each king
+# carries a running measure of how much enemy material is near it.  This is the
+# classic "king tropism" idea (Chess Programming Wiki), made free here by the
+# incremental make/unmake: the value is maintained in _eval_add/_eval_sub and so
+# costs nothing per evaluation.
+_WT = (0, 1, 2, 2, 3, 0, 1, 2, 2, 3, 0)     # attacker weight by code (K -> 0)
+_PROX_RANGE = 3                              # only pieces this close matter
+_PROX = []
+for _k in range(48):
+    _kr, _kc = divmod(_k, BW)
+    _row = []
+    for _s in range(48):
+        _sr, _sc = divmod(_s, BW)
+        _d = max(abs(_sr - _kr), abs(_sc - _kc))
+        _row.append(_PROX_RANGE + 1 - _d if 0 < _d <= _PROX_RANGE else 0)
+    _PROX.append(tuple(_row))
+
 # Fully precomputed static score per (piece code, square): signed material +
 # piece-square table + centralisation folded into a single table lookup, so
 # the hot evaluation loop does one indexing per occupied square.
@@ -193,6 +212,9 @@ class B23CS1001:
     EASY_STABILITY = 3             # same best move for N moves with a steady
     EASY_DROP = 30                 # score -> the move is obvious, spend less
     EASY_MULT = 0.5
+    # --- check-avoidance (king pressure) evaluation ------------------------
+    PRESS_SCALE = 1                # weight of the king-pressure difference
+    PRESS_CAP = 30                 # hard cap (1.5 pawns): never beats material
 
     def __init__(self, engine, depth=6, max_depth=12):
         self.engine = engine
@@ -213,6 +235,9 @@ class B23CS1001:
         # Cross-move search history driving the dynamic time control.
         self._last_stability = 0      # consecutive moves with an unchanged best
         self._last_drop = 0           # score drop over the previous move
+        # King-pressure state (check avoidance), maintained incrementally.
+        self._press_w = 0             # enemy pressure around the white king
+        self._press_b = 0             # enemy pressure around the black king
 
     # ------------------------------------------------------------- setup
     def _load(self):
@@ -249,14 +274,64 @@ class B23CS1001:
         self.bnk = bnk
         self.wpow = wpow
         self.bpow = bpow
+        # King pressure (check avoidance): computed once here, then maintained
+        # incrementally by _eval_add/_eval_sub.
+        self._press_w = self._pressure_on(wk, False)
+        self._press_b = self._pressure_on(bk, True)
+
+    def _pressure_on(self, ksq, by_white):
+        """From-scratch king pressure: enemy material near the king (tropism)."""
+        if ksq < 0:
+            return 0
+        b = self.b
+        prox = _PROX[ksq]
+        tot = 0
+        for i in range(48):
+            p = b[i]
+            if p != E and (p < 6) == by_white:
+                w = _WT[p]
+                if w:
+                    tot += w * prox[i]
+        return tot
+
+    def _press_add(self, code, sq, sign):
+        """Add/remove `code`'s contribution to the pressure on the enemy king."""
+        w = _WT[code]
+        if w:
+            if code < 6:
+                ek = self._bk
+                if ek >= 0:
+                    self._press_b += sign * w * _PROX[ek][sq]
+            else:
+                ek = self._wk
+                if ek >= 0:
+                    self._press_w += sign * w * _PROX[ek][sq]
+
+    def _press_captured(self, code, sq, sign):
+        """Add/remove a captured piece's pressure on the king of its own colour."""
+        w = _WT[code]
+        if w:
+            if code < 6:
+                ck = self._wk
+                if ck >= 0:
+                    self._press_w += sign * w * _PROX[ck][sq]
+            else:
+                ck = self._bk
+                if ck >= 0:
+                    self._press_b += sign * w * _PROX[ck][sq]
 
     def _eval_add(self, piece, fr, to, captured):
         """Incremental evaluation update when `piece` moves fr -> to."""
         self._static += _STATIC[piece][to] - _STATIC[piece][fr]
+        king_moved = piece == WK or piece == BK
         if piece == WK:
             self._wk = to
         elif piece == BK:
             self._bk = to
+        else:
+            # The mover carries its king pressure along with it.
+            self._press_add(piece, to, 1)
+            self._press_add(piece, fr, -1)
         if captured:
             self._static -= _STATIC[captured][to]
             if captured < 6:
@@ -265,14 +340,25 @@ class B23CS1001:
             else:
                 self.bnk -= 1
                 self.bpow -= _VAL[captured]
+            self._press_captured(captured, to, -1)
+        if king_moved:
+            # Every enemy piece's proximity changes when a king moves.
+            if piece == WK:
+                self._press_w = self._pressure_on(to, False)
+            else:
+                self._press_b = self._pressure_on(to, True)
 
     def _eval_sub(self, piece, fr, to, captured):
         """Reverse of _eval_add (undo a move)."""
         self._static -= _STATIC[piece][to] - _STATIC[piece][fr]
+        king_moved = piece == WK or piece == BK
         if piece == WK:
             self._wk = fr
         elif piece == BK:
             self._bk = fr
+        else:
+            self._press_add(piece, to, -1)
+            self._press_add(piece, fr, 1)
         if captured:
             self._static += _STATIC[captured][to]
             if captured < 6:
@@ -281,6 +367,12 @@ class B23CS1001:
             else:
                 self.bnk += 1
                 self.bpow += _VAL[captured]
+            self._press_captured(captured, to, 1)
+        if king_moved:
+            if piece == WK:
+                self._press_w = self._pressure_on(fr, False)
+            else:
+                self._press_b = self._pressure_on(fr, True)
 
     def _position_key(self):
         # Each square is a 0..10 code, so bytes() is a very fast exact key.
@@ -1132,6 +1224,23 @@ class B23CS1001:
                         score -= 6
                     if bc + 1 < BW and b[base + bc + 1] == BP:
                         score -= 6
+
+        # Check avoidance: enemy material near a king is what generates the
+        # endless stream of +2 checks (and then the mates).  Bounded by
+        # PRESS_CAP and only counted while the attacker still has real material,
+        # so it can never outweigh material - and never a mate, because a mate
+        # score is ~100000 and always overrules any evaluation term.
+        press = 0
+        if w_nk >= 2:                     # white attacks the black king
+            press += self._press_b
+        if b_nk >= 2:                     # black attacks the white king
+            press -= self._press_w
+        if press:
+            if press > self.PRESS_CAP:
+                press = self.PRESS_CAP
+            elif press < -self.PRESS_CAP:
+                press = -self.PRESS_CAP
+            score += press * self.PRESS_SCALE
 
         if w_pow - b_pow >= 100 and b_nk <= 1 and w_king >= 0 and b_king >= 0:
             score += self._drive_bonus('w', w_king, b_king)

@@ -187,4 +187,84 @@ The two bounds are then used by the search loop:
 | `PANIC_DROP` / `PANIC_MULT` | 100 / 1.5 | score fell → think harder |
 | `EASY_STABILITY` / `EASY_DROP` / `EASY_MULT` | 3 / 30 / 0.5 | obvious move → spend less |
 
-<!--END-->
+---
+
+## 3. Measured behaviour of the allocator
+
+Allocator output at `time_used = 25 s`, `moves_done = 30`, 20 legal moves:
+
+| Position type | soft | hard | vs the plain-chess baseline |
+|---|---|---|---|
+| **we can force mate** | **1.75 s** | **4.38 s** | ×3 burst — mate is +600 |
+| we are in check | 0.88 s | 2.19 s | ×1.5 |
+| panic (score fell 150) | 0.88 s | 2.19 s | ×1.5 |
+| obvious & stable (3 moves) | 0.29 s | 0.73 s | **÷2** |
+| ordinary midgame | 0.58 s | 1.46 s | 1× |
+
+Early game it spends ~0.6 s/move; when the clock gets low it shrinks with the
+clock (`very low clock`, 57 s used → soft 0.15 s, hard 0.38 s).
+
+Result in practice: the start position now reaches **depth 9 in 0.42 s** with the
+agent's own clock, versus depth 8 at the harness's old fixed 0.35 s.
+
+## 4. Safety: can we lose on time? (the invariant, and proof by simulation)
+
+Because running out of time **loses the game**, the allocator is built so that
+this is *structurally* impossible inside a legal game:
+
+* every move takes at most `MAX_SHARE_CRIT = 35 %` of the remaining clock, so
+  the clock decays geometrically and can never reach zero;
+* the floor also scales with the clock (`min(0.15, remaining*0.1)`) — a *fixed*
+  floor was the one hole (it spent more than half of a nearly empty clock, and
+  would drift past 60 s), which the simulation caught and which is now fixed;
+* games are capped at 150 plies = at most 75 of our moves.
+
+Simulation over the **maximum possible game** (75 of our moves):
+
+| Strategy | Time used of 60 s | Left |
+|---|---|---|
+| spend `soft` every move (realistic) | 54.85 s | **5.15 s** |
+| spend `hard` every move (**pathological**) | 59.95 s | **0.05 s** |
+
+Both stay inside the clock ⇒ a time-out loss is not reachable. The soft path
+leaving ~5 s is deliberate: it also absorbs the fact that the agent's own
+`time_used` accounting ignores sub-millisecond overheads.
+
+Trajectory (spending soft): 0.60 s → 0.63 s → 0.68 s → 0.76 s → 0.90 s at
+moves 0/15/30/45/60, then it shrinks as the clock is consumed.
+
+## 5. Changes made
+
+1. `B23CS1001.py`
+   * new `_plan_time(moves_done, in_check, drive, few, n_root)` — the allocator;
+   * `get_best_move` rewritten around `soft`/`hard`: forced-move fast path,
+     "don't start an iteration that cannot finish", panic-time upgrade to `hard`
+     (best-move change or score drop), early stop when a mate is found;
+   * new state `_last_stability`, `_last_drop` carried across moves;
+   * all time constants are class attributes of `B23CS1001` (single-file
+     submission; nothing is defined in the test harness).
+2. `run_games_fast.py` (test harness only)
+   * no longer sets `test_budget`/`max_depth` — it now builds the agent exactly
+     as the official runner does (`B23CS1001(engine)`), so the agent's own clock
+     is what gets measured;
+   * keeps the per-player 60 s clock, and a player who runs out **loses**.
+
+Validation so far: compiles, `smoke_test.py` **PASSED**, allocator table and
+safety simulations above. `run_parity.py` is unaffected (move generation and
+evaluation were not touched, and their correctness gate already passes).
+
+## 6. Next experiments (in priority order)
+
+1. **A/B the dynamic allocator vs the old fixed budget** with the per-player
+   clock harness — the allocated time only shows up over a full game.
+2. Tune the two dominant multipliers first (`DRIVE_MULT`, and whether
+   `CHECK_MULT` should be higher, since being mated is the failure we actually
+   observe).
+3. Replace `ITER_PREDICT` (a constant 2.5×) with a **node-rate-based** estimate:
+   we already know the previous iteration's nodes and time, so
+   `projected = elapsed * (branching estimate)` could be measured directly.
+4. A true **easy-move exit**: stop after an iteration when the best move has been
+   stable for N iterations *and* the projected next iteration would not fit.
+5. Re-check `TIME_FRACTION` / `MIN_MOVES_LEFT`: they trade late-game safety
+   margin for depth in long games.
+
