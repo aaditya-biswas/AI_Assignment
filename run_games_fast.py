@@ -11,6 +11,7 @@ from B23CS1001 import B23CS1001             # noqa: E402
 from p22cs201 import P22CS201               # noqa: E402
 from p25cs0004 import P25CS0004             # noqa: E402
 from B23ME1074 import B23ME1074             # noqa: E402
+from B23ES1030 import B23ES1030             # noqa: E402
 BUDGET = 0.35
 MAX_DEPTH = 8
 CAP = 150
@@ -76,7 +77,8 @@ def play(white_cls, black_cls):
 
 def main():
     for pair in [
-                 (B23CS1001, B23ME1074), (B23CS1001, B23ME1074), (B23CS1001, B23ME1074)]:
+                 (B23CS1001, B23ES1030), (B23ES1030, B23ME1074), (B23CS1001, B23ME1074),
+                 (B23ME1074, B23CS1001), ]:
         play(*pair)
     print("FAST GAUNTLET DONE", flush=True)
 

@@ -1,4 +1,4 @@
-""
+""""
 Single-file adversarial agent for Spartans Chess (6x8, no queens).
 
 """
@@ -310,7 +310,6 @@ class B23CS1001:
                     for mv in ordered:
                         fr = _idx(mv.start_row, mv.start_col)
                         to = _idx(mv.end_row, mv.end_col)
-                        mover = 'w' if self.wtm else 'b'
                         piece = self.b[fr]
                         captured = self.b[to]
                         self.b[to] = piece
@@ -329,10 +328,6 @@ class B23CS1001:
                         self.b[to] = captured
                         self.wtm = not self.wtm
                         self._eval_sub(piece, fr, to, captured)
-                        # +2 per check, matching the official scoring.
-                        eking = self._bk if mover == 'w' else self._wk
-                        if eking >= 0 and self._attacked(eking, mover):
-                            score += 2
                         if score > cur_score:
                             cur_score = score
                         if score > alpha:
@@ -658,7 +653,7 @@ class B23CS1001:
         my_white = self.wtm
         my = 'w' if my_white else 'b'
         opp = 'b' if my_white else 'w'
-        # One evaluation scan also yields both king squares (via self._wk/_bk).
+        # King squares are tracked incrementally (self._wk / self._bk).
         stand_pat = self._evaluate_stm()
         myk = self._wk if my_white else self._bk
         in_check = myk >= 0 and self._attacked(myk, opp)
@@ -948,12 +943,13 @@ class B23CS1001:
         return v if self.wtm else -v
 
     def _evaluate_white(self):
-        """Fast single-pass static evaluation (white-positive).
+        """Static evaluation (white-positive), O(1) in the midgame.
 
         Material + piece-square tables dominate (they mirror the tournament
         scoring), with small centralisation, passed-pawn and king-safety terms.
-        Everything is plain ints computed in one 48-square scan (no dict of
-        dicts), which makes it cheap enough to call at every leaf.
+        The material/PST/centre part and the king squares are maintained
+        incrementally on every make/unmake (see `_load`); only the endgame
+        passed-pawn scan touches the board.
         """
         b = self.b
         # Everything below is maintained incrementally (see _load / make-unmake),

@@ -390,6 +390,76 @@ The pawn opening's apparent lead was entirely a few +/-600 mate events swinging
 the other way late. So the opening choice is **statistically neutral**, and no
 book was adopted.
 
+---
+
+## Round 8: valuing checks in the search - tried and REVERTED
+
+Observation: vs B23ME1074 we give ~0-6 checks while it gives ~2-32 (each worth
++2 in the official score), i.e. a ~50-point handicap in quiet games.
+
+Implementation tried:
+- precomputed, per (piece type, enemy-king square), bitmasks of the squares from
+  which that piece would attack the king (a cheap pre-filter), then
+- **+2 per check** for moves near the root (root loop and `ply <= 2` in
+  `_negamax`), matching the official scoring.
+
+Result (paired, deterministic, 6 identical seeded games, fixed depth 5):
+
+| Arm | Total |
+|---|---|
+| no check bonus | **+828** |
+| with check bonus | **-132** |
+| delta | **-960** |
+
+And it hardly increased checks (seeds 3-6: 12 vs 0 checks, yet -40 vs +76). The
++2 is too small to survive the position: preferring checks distorted the search,
+cost material and **stopped finding mates** (seed 2: no-bonus mated, bonus did
+not). Fully reverted (`_CF_` / `CHECK_BONUS` refs = 0; parity PASSED).
+
+**Lesson:** in this variant a check is worth only 2 points, while a pawn is 20 and
+a mate is 600 - so optimising directly for checks trades away far more than it
+gains. Match the search objective to the *dominant* term (material and mate), not
+to the small ones.
+
+---
+
+## Round 9: single-pass `_legal_moves` - measured, performance-NEUTRAL, reverted
+
+Round 8 left the search objective alone, so the remaining lever was raw speed:
+`_legal_moves` had been building an intermediate `pseudo` list of `(from, to)`
+pairs and then walking it a *second* time to validate/emit.
+
+Change tried: compute the check/pin state **before** generation, hoist the
+"needs the attack test" decision to once per piece (`tst = must_test or i == ksq
+or (pinned >> i) & 1` - it depends on the piece, not the move), and emit each
+generated move straight into either `legal` or a small `need` list. That removes
+one tuple allocation and one list append per generated move plus the entire
+second pass.
+
+Correctness: **exact** - the returned move sets are identical to the previous
+implementation (quiet and `drive` modes), `run_parity.py` PASSED, `smoke_test.py`
+PASSED.
+
+Speed: **no gain.** Measured with CPU time (`time.process_time`, immune to
+machine load), alternating the two versions in one process on the same position:
+
+| Measurement | single-pass | previous |
+|---|---|---|
+| `_legal_moves` median | 15.752 us/call | 15.720 us/call |
+| fixed-depth-7 search, median NPS | 57,376 | 61,092 |
+
+The search node counts were also essentially the same (11,350 vs 11,325 - the
+only difference is the *order* of king/pinned moves, which now come after the
+rest, shifting a couple of tie-breaks). Both versions' NPS readings were bimodal
+(~40k vs ~63k) under load, which is machine noise, not code.
+
+Conclusion: the second pass was never the bottleneck - the 48-square scan and
+the per-ray loops dominate - so this is all cost, no benefit. Reverted.
+
+**Lesson:** profile before optimising. A "obviously wasteful" intermediate list
+was worth ~0% here; the measurement (CPU time, same process, alternating) is
+what settles it, not the intuition.
+
 ### Considered but not adopted (with reasons)
 
 - **Full incremental Zobrist hashing**: `bytes(self.b)` is already 0.52 µs per
