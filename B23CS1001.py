@@ -1,25 +1,6 @@
-"""
+""
 Single-file adversarial agent for Spartans Chess (6x8, no queens).
 
-This file is the ONLY agent file we modify (the allocated template
-ai_player.py).  For submission it is renamed to B23CS1001.py with the class
-already named B23CS1001.  The tournament engine (board.py / config.py /
-game_runner.py) is NEVER modified.
-
-Speed layer
------------
-Searching on top of the engine's get_legal_moves() is slow (~15k nodes/s), so
-this file contains a private, read-only COPY of the game rules operating on a
-flat 48-square board.  It is validated against engine.get_legal_moves() by a
-differential test (see run_parity.py).  Every rule matches the engine exactly:
-pawns move one square, no castling/en-passant/promotion, generate-then-check.
-
-Search design (alpha-beta negamax + iterative deepening):
-  - capture-first (MVV-LVA) move ordering
-  - horizon handling: light check extension + terminal detection whenever few
-    pieces remain (never "win" into a stalemate, never miss a mate)
-  - per-node deadline check -> never blows the 60 second game clock
-  - endgame evaluation drives the king forward and the enemy king to the edge
 """
 import math
 import time
@@ -203,6 +184,65 @@ class B23CS1001:
                 b.append(_CODE[p])
         self.b = b
         self.wtm = self.engine.white_to_move
+        # Incremental evaluation state (kept in sync on every make/unmake).
+        static = 0
+        wk = bk = -1
+        wnk = bnk = 0
+        wpow = bpow = 0
+        for i in range(48):
+            p = b[i]
+            if p == E:
+                continue
+            static += _STATIC[p][i]
+            if p == WK:
+                wk = i
+            elif p == BK:
+                bk = i
+            elif p < 6:
+                wnk += 1
+                wpow += _VAL[p]
+            else:
+                bnk += 1
+                bpow += _VAL[p]
+        self._static = static
+        self._wk = wk
+        self._bk = bk
+        self.wnk = wnk
+        self.bnk = bnk
+        self.wpow = wpow
+        self.bpow = bpow
+
+    def _eval_add(self, piece, fr, to, captured):
+        """Incremental evaluation update when `piece` moves fr -> to."""
+        self._static += _STATIC[piece][to] - _STATIC[piece][fr]
+        if piece == WK:
+            self._wk = to
+        elif piece == BK:
+            self._bk = to
+        if captured:
+            self._static -= _STATIC[captured][to]
+            if captured < 6:
+                self.wnk -= 1
+                self.wpow -= _VAL[captured]
+            else:
+                self.bnk -= 1
+                self.bpow -= _VAL[captured]
+
+    def _eval_sub(self, piece, fr, to, captured):
+        """Reverse of _eval_add (undo a move)."""
+        self._static -= _STATIC[piece][to] - _STATIC[piece][fr]
+        if piece == WK:
+            self._wk = fr
+        elif piece == BK:
+            self._bk = fr
+        if captured:
+            self._static += _STATIC[captured][to]
+            if captured < 6:
+                self.wnk += 1
+                self.wpow += _VAL[captured]
+            else:
+                self.bnk += 1
+                self.bpow += _VAL[captured]
 
     def _position_key(self):
         # Each square is a 0..10 code, so bytes() is a very fast exact key.
@@ -270,21 +310,29 @@ class B23CS1001:
                     for mv in ordered:
                         fr = _idx(mv.start_row, mv.start_col)
                         to = _idx(mv.end_row, mv.end_col)
+                        mover = 'w' if self.wtm else 'b'
                         piece = self.b[fr]
                         captured = self.b[to]
                         self.b[to] = piece
                         self.b[fr] = E
                         self.wtm = not self.wtm
+                        self._eval_add(piece, fr, to, captured)
                         try:
                             score = -self._negamax(d - 1, -beta, -alpha, 1)
                         except _AbortSearch:
                             self.b[fr] = piece
                             self.b[to] = captured
                             self.wtm = not self.wtm
+                            self._eval_sub(piece, fr, to, captured)
                             raise
                         self.b[fr] = piece
                         self.b[to] = captured
                         self.wtm = not self.wtm
+                        self._eval_sub(piece, fr, to, captured)
+                        # +2 per check, matching the official scoring.
+                        eking = self._bk if mover == 'w' else self._wk
+                        if eking >= 0 and self._attacked(eking, mover):
+                            score += 2
                         if score > cur_score:
                             cur_score = score
                         if score > alpha:
@@ -425,6 +473,7 @@ class B23CS1001:
             b[to] = piece
             b[fr] = E
             self.wtm = not self.wtm
+            self._eval_add(piece, fr, to, captured)
             try:
                 if idx == 0:
                     score = -ng(depth - 1, -beta, -alpha, ply + 1)
@@ -443,10 +492,12 @@ class B23CS1001:
                 b[fr] = piece
                 b[to] = captured
                 self.wtm = not self.wtm
+                self._eval_sub(piece, fr, to, captured)
                 raise
             b[fr] = piece
             b[to] = captured
             self.wtm = not self.wtm
+            self._eval_sub(piece, fr, to, captured)
             if score > best_score:
                 best_score = score
                 best_move = (fr, to)
@@ -624,10 +675,12 @@ class B23CS1001:
                 b[to] = piece
                 b[fr] = E
                 self.wtm = not self.wtm
+                self._eval_add(piece, fr, to, captured)
                 score = -self._quiescence(-beta, -alpha, qdepth + 1)
                 b[fr] = piece
                 b[to] = captured
                 self.wtm = not self.wtm
+                self._eval_sub(piece, fr, to, captured)
                 if score > alpha:
                     alpha = score
                 if alpha >= beta:
@@ -652,10 +705,12 @@ class B23CS1001:
             b[to] = piece
             b[fr] = E
             self.wtm = not self.wtm
+            self._eval_add(piece, fr, to, captured)
             score = -self._quiescence(-beta, -alpha, qdepth + 1)
             b[fr] = piece
             b[to] = captured
             self.wtm = not self.wtm
+            self._eval_sub(piece, fr, to, captured)
             if score > alpha:
                 alpha = score
             if alpha >= beta:
@@ -901,69 +956,72 @@ class B23CS1001:
         dicts), which makes it cheap enough to call at every leaf.
         """
         b = self.b
-        score = 0
-        w_king = b_king = -1
-        w_pow = b_pow = 0
-        w_nk = b_nk = 0
-        w_pawns = []
-        b_pawns = []
-        for i in range(48):
-            p = b[i]
-            if p == E:
-                continue
-            if p == WK:
-                w_king = i
-                continue
-            if p == BK:
-                b_king = i
-                continue
-            score += _STATIC[p][i]
-            if p < 6:
-                w_pow += _VAL[p]
-                w_nk += 1
+        # Everything below is maintained incrementally (see _load / make-unmake),
+        # so the common midgame evaluation is O(1) - no 48-square scan.
+        score = self._static
+        w_king = self._wk
+        b_king = self._bk
+        w_nk = self.wnk
+        b_nk = self.bnk
+        w_pow = self.wpow
+        b_pow = self.bpow
+        nk = w_nk + b_nk
+        if nk <= 12:
+            # Passed-pawn scan (endgame only), so the common midgame eval never
+            # has to collect pawn squares.
+            for i in range(48):
+                p = b[i]
                 if p == WP:
-                    w_pawns.append(i)
-            else:
-                b_pow += _VAL[p]
-                b_nk += 1
-                if p == BP:
-                    b_pawns.append(i)
-
-        if w_nk + b_nk <= 12:
-            for i in w_pawns:
-                r = i // BW
-                c = i - r * BW
-                for rr in range(r - 1, -1, -1):
-                    base = rr * BW
-                    if b[base + c] == BP or \
-                            (c > 0 and b[base + c - 1] == BP) or \
-                            (c + 1 < BW and b[base + c + 1] == BP):
-                        break
-                else:
-                    score += 10 + (BH - 1 - r) * 4
-            for i in b_pawns:
-                r = i // BW
-                c = i - r * BW
-                for rr in range(r + 1, BH):
-                    base = rr * BW
-                    if b[base + c] == WP or \
-                            (c > 0 and b[base + c - 1] == WP) or \
-                            (c + 1 < BW and b[base + c + 1] == WP):
-                        break
-                else:
-                    score -= 10 + r * 4
+                    r = i // BW
+                    c = i - r * BW
+                    for rr in range(r - 1, -1, -1):
+                        base = rr * BW
+                        if b[base + c] == BP or \
+                                (c > 0 and b[base + c - 1] == BP) or \
+                                (c + 1 < BW and b[base + c + 1] == BP):
+                            break
+                    else:
+                        score += 10 + (BH - 1 - r) * 4
+                elif p == BP:
+                    r = i // BW
+                    c = i - r * BW
+                    for rr in range(r + 1, BH):
+                        base = rr * BW
+                        if b[base + c] == WP or \
+                                (c > 0 and b[base + c - 1] == WP) or \
+                                (c + 1 < BW and b[base + c + 1] == WP):
+                            break
+                    else:
+                        score -= 10 + r * 4
 
         if w_king >= 0 and b_king >= 0:
-            if w_nk + b_nk <= 6:
-                wr = w_king // BW
-                wc = w_king - wr * BW
-                br = b_king // BW
-                bc = b_king - br * BW
+            wr = w_king // BW
+            wc = w_king - wr * BW
+            br = b_king // BW
+            bc = b_king - br * BW
+            if nk <= 6:
                 score += KING_PST[wr][wc]
                 score -= KING_PST[BH - 1 - br][bc]
             else:
-                score += self._king_shield(w_king, 'w')
-                score -= self._king_shield(b_king, 'b')
+                # King shield (inlined): friendly pawns in front of each king.
+                rr = wr - 1
+                if rr >= 0:
+                    base = rr * BW
+                    if wc > 0 and b[base + wc - 1] == WP:
+                        score += 6
+                    if b[base + wc] == WP:
+                        score += 6
+                    if wc + 1 < BW and b[base + wc + 1] == WP:
+                        score += 6
+                rr = br + 1
+                if rr < BH:
+                    base = rr * BW
+                    if bc > 0 and b[base + bc - 1] == BP:
+                        score -= 6
+                    if b[base + bc] == BP:
+                        score -= 6
+                    if bc + 1 < BW and b[base + bc + 1] == BP:
+                        score -= 6
 
         if w_pow - b_pow >= 100 and b_nk <= 1 and w_king >= 0 and b_king >= 0:
             score += self._drive_bonus('w', w_king, b_king)
@@ -974,25 +1032,6 @@ class B23CS1001:
         self._wk = w_king
         self._bk = b_king
         return score
-
-    def _king_shield(self, ksq, col):
-        """Small bonus for friendly pawns directly in front of the king."""
-        b = self.b
-        r = ksq // BW
-        c = ksq - r * BW
-        rr = r - 1 if col == 'w' else r + 1
-        if rr < 0 or rr >= BH:
-            return 0
-        base = rr * BW
-        pawn = WP if col == 'w' else BP
-        s = 0
-        if c > 0 and b[base + c - 1] == pawn:
-            s += 6
-        if b[base + c] == pawn:
-            s += 6
-        if c + 1 < BW and b[base + c + 1] == pawn:
-            s += 6
-        return s
 
     def _drive_bonus(self, leader, lk, ek):
         """Positive score (for `leader`) pushing the enemy king to the edge
@@ -1033,6 +1072,7 @@ class B23CS1001:
             return MATE if self.engine.white_to_move else -MATE
         if game_state == "stalemate":
             return 0
+        self._load()
         return self._evaluate_white()
 
 

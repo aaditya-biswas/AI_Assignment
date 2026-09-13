@@ -311,6 +311,85 @@ The speed round roughly **tripled the mate rate** and produced a strongly positi
 tournament score. Conclusion: prioritise depth (speed) and mate-finding over
 capture-diff tuning.
 
+---
+
+## Round 6: incremental evaluation (O(1) midgame eval) — ~30% faster
+
+The profile showed `_evaluate_white` was the top cost and `list.append` a large
+share (the eval built pawn lists every call). Two changes:
+
+- **No pawn lists in the common case.** `_evaluate_white` no longer collects pawn
+  squares; the passed-pawn scan runs only when `pieces <= 12` (endgame). The king
+  shield is inlined (removed ~12k method calls/move).
+- **Incremental material + PST(+centre).** A running `self._static` (plus king
+  squares, non-king counts and material powers) is maintained on every
+  apply/unapply in `get_best_move`, `_negamax` and `_quiescence` via small
+  `_eval_add` / `_eval_sub` helpers, initialised in `_load`. `_evaluate_white`
+  now reads this state, so midgame evaluation is **O(1)** (endgames still do the
+  one passed-pawn scan).
+
+### Validation (all passing)
+
+- **Fixed-depth equivalence**: 450 positions gave identical move + node counts vs
+  the previous version (the incremental eval is exact).
+- **State consistency**: 300 checks (including forced aborts) - the incremental
+  state always matched a from-scratch recomputation.
+- `run_parity.py` PASSED; `test_endgame.py` 5/5.
+
+### Measured speedup (alternating A/B, total nodes searched in 0.35 s)
+
+| Position | previous | now |
+|---|---|---|
+| start | 11709 / 14752 | 15205 / **20652** |
+| midgame | 21363 / 20258 | 25501 / **26096** |
+
+The new version also reached **depth 8** on the start position (previous mostly
+depth 7) - roughly **+25-35% throughput** on top of round 5.
+
+---
+
+## Round 7: opening book - investigated, not adopted
+
+Motivation: as White the agent looked weaker than as Black, so an opening book
+was trialled. A single forced first move was measured over several games each
+(all as White vs B23ME1074, official scoring):
+
+| First move | sample | total |
+|---|---|---|
+| default `(7,0)->(5,1)` | 12 games | **+176** |
+| pawn `(6,4)->(5,4)` | 8 games | +206 |
+| pawn `(6,3)->(5,3)` | 4 games | -288 |
+| pawn `(6,2)->(5,2)` | 2 games | -200 |
+
+An initial 8-game sample made the default look terrible (-578) and a pawn push
+look good, but a coding mistake in the test (it forced `(7,5)->(5,4)`, which is
+**illegal** because `(7,5)` is a bishop, so it silently fell back to the default)
+revealed that the "default" arm then scored **+754** - i.e. the spread is pure
+**variance**, dominated by +/-600 mate results.
+
+Conclusion: **the opening move is not the bottleneck**; the differences are within
+run-to-run noise. The book was removed (the agent is back to the verified state:
+parity PASSED, first move chosen by search). The real swing is **mates** - as
+White the agent has been mated outright in some games, and a single mate flips
+the official score by 600. Future work should target **king safety / mate
+avoidance**, not the opening.
+
+### Paired, deterministic confirmation (final)
+
+To remove the mate-driven noise, both openings were then played on **identical**
+seeded games with our agent at a fixed depth (deterministic) - 12 paired seeds:
+
+| Arm | Total official score |
+|---|---|
+| default `(7,0)->(5,1)` | **+496** |
+| pawn `(6,4)->(5,4)` | **+412** |
+| delta (pawn − default) | **−84** |
+
+Per-seed deltas: `-50, -616, 0, +652, +598, -78, -24, +84, 0, -78, -24, -548`.
+The pawn opening's apparent lead was entirely a few +/-600 mate events swinging
+the other way late. So the opening choice is **statistically neutral**, and no
+book was adopted.
+
 ### Considered but not adopted (with reasons)
 
 - **Full incremental Zobrist hashing**: `bytes(self.b)` is already 0.52 µs per

@@ -79,3 +79,31 @@ same lesson as the earlier futility attempt.
 
 parity PASSED, depth not lower, and B23ME1074 multi-game net >= +550 (6 games).
 
+---
+
+## Official scoring (from AI_Assignment_I.pdf)
+
+Important: the raw gauntlet `pts` are capture-only and do **not** match the
+assignment. The assignment scores:
+
+- Points: **check +2**, pawn +20, bishop +70, knight +70, rook +100,
+  checkmate (capturing king) **+600**
+- Match Score Card (final): checkmate -> winner **600 / loser 0** (overrides
+  captures); loss -> 0; draw/stalemate -> Points table (captures + checks)
+
+`run_games_fast.py` was updated (it is only a test harness) to print this
+`official` score alongside the capture breakdown.
+
+### Official-score head-to-head vs B23ME1074 (6 games each, same harness)
+
+| Config | Official diff | Mates (us - them) |
+|---|---|---|
+| **CURRENT (speed round; ~depth 8)** | **+1538** | **2 - 0** |
+| BASELINE (git HEAD; ~depth 7) | **-906** | 1 - 3 |
+
+The extra ply from the speed round both scores mates and prevents being mated -
+a ~+2444 swing on the metric that actually decides games. This is the clearest
+signal yet that **effective depth (speed) is the dominant lever**, and that
+mate-count (not capture diff) is the objective.
+
+
