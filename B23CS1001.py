@@ -1,7 +1,4 @@
-"""
-Single-file adversarial agent for Spartans Chess (6x8, no queens).
-
-"""
+"""Single-file adversarial agent for Spartans Chess (6x8, no queens)."""
 import math
 import time
 
@@ -13,17 +10,13 @@ from config import (
 
 
 MATE = 100000            # scores for mates exceed any material total
-FEW_PIECE_LIMIT = 9      # at/below this many pieces: cheap terminal check
+FEW_PIECE_LIMIT = 9
 KING_PST = KING_PST_LATE_GAME
 
 TT_EXACT = 0
 TT_LOWER = 1
 TT_UPPER = 2
 
-# ------------------------------------------------------------------ int board
-# Internally the agent works on a flat list of small ints instead of the
-# engine's 2-char strings (0 empty, 1..5 = white P/N/B/R/K, 6..10 = black).
-# Integer compares/indexing are markedly faster than string slicing, which is
 # where the search spends most of its time.
 E = 0
 WP, WN, WB, WR, WK = 1, 2, 3, 4, 5
@@ -35,24 +28,11 @@ _VAL = (0, 20, 70, 70, 100, 600, 20, 70, 70, 100, 600)
 _VAL_SIGN = (0, 20, 70, 70, 100, 600, -20, -70, -70, -100, -600)
 _PTVAL = (0, 20, 70, 70, 100, 0)            # by type index (king -> 0)
 
-# ------------------------------------------------------- king pressure (checks)
-# "Check avoidance" evaluation: enemy pieces hanging around our king are what
-# produce the endless stream of +2 checks (and eventually mates), so each king
-# carries a running measure of how much enemy material is near it.  This is the
-# classic "king tropism" idea (Chess Programming Wiki), made free here by the
-# incremental make/unmake: the value is maintained in _eval_add/_eval_sub and so
-# costs nothing per evaluation.
 _WT = (0, 1, 2, 2, 3, 0, 1, 2, 2, 3, 0)     # attacker weight by code (K -> 0)
-# Distances 1-3 are weighted by closeness (3/2/1).  Chebyshev distance is blind
-# to long-range attackers though - a rook checking down an open file or a bishop
-# on a diagonal is a real +2-check threat from any distance - so _PROX_FAR gives
-# those squares a flat weight out to _PROX_RANGE.  Measured against real games
-# the opponent scored 60-116 points from checks, so this reach matters.
 _PROX_RANGE = 3                              # only pieces this close matter
-_PROX_FAR = 0                                # flat weight out to _PROX_RANGE
 
 
-def _build_prox(prox_range=_PROX_RANGE, far=_PROX_FAR):
+def _build_prox(prox_range=_PROX_RANGE):
     """King tropism table: weight per (king square, enemy square) pair."""
     table = []
     for _k in range(48):
@@ -61,29 +41,15 @@ def _build_prox(prox_range=_PROX_RANGE, far=_PROX_FAR):
         for _s in range(48):
             _sr, _sc = divmod(_s, BW)
             _d = max(abs(_sr - _kr), abs(_sc - _kc))
-            if _d == 0 or _d > prox_range:
-                _row.append(0)
-            elif _d <= 3:
-                _row.append(4 - _d)
-            else:
-                _row.append(far)
+            _row.append(0 if _d == 0 or _d > prox_range else 4 - _d)
         table.append(tuple(_row))
     return table
 
 
 _PROX = _build_prox()
 
-# Fully precomputed static score per (piece code, square): signed material +
-# piece-square table + centralisation folded into a single table lookup, so
-# the hot evaluation loop does one indexing per occupied square.
 _STATIC = [None] * 11
 _PST_OF = {1: PAWN_PST, 2: KNIGHT_PST, 3: BISHOP_PST, 4: ROOK_PST}
-# The official scorecard pays ONLY material (and checks), so the search must not
-# trade a 20-point pawn for a positional nicety: _POS_SCALE shrinks the
-# positional part (piece-square table + centralisation) while the material part
-# stays exactly at the tournament values.  Measured over a fixed 48-position
-# suite, 1.0 left 6.7 points of material hanging per position, 0.5 leaves 2.5,
-# and 0.25 is worse again (4.6) - so 0.5 is what this variant wants.
 _POS_SCALE = 0.5
 
 
@@ -134,9 +100,6 @@ _BISHOP_DC = (1, -1, 1, -1)
 _ROOK_DR = (1, -1, 0, 0)
 _ROOK_DC = (0, 0, 1, -1)
 
-# ---------------------------------------------------------------- fast tables
-# Precomputed per-square attack geometry so the hot paths never do bounds
-# checks or function calls.  Built once at import time (48 squares).
 _KNIGHT_ATT = []
 _KING_ATT = []
 _BISHOP_RAYS = []
@@ -174,19 +137,16 @@ for _r in range(BH):
 
 MATE_BOUND = MATE - 1000   # scores beyond this encode mate distances
 QMAX = 6                   # quiescence depth cap
-_ABORT_MASK = 15           # test the hard deadline every 16 nodes.  The drift a
+_ABORT_MASK = 15
                            # move overshoots by is what eats the clock reserve
                            # over a long game, and it scales with NPS: at 255
                            # nodes it was ~2 s per game even under CPU load,
                            # against ~0.6 s here.  One time.monotonic() per 16
                            # nodes is well under 0.1% of the run time.
 
-# Inverse pawn tables: the squares a white/black pawn would have to stand on in
-# order to attack a given square (same geometry as the opposite pawn's captures).
 _PAWN_CAP_W_inv = _PAWN_CAP_B
 _PAWN_CAP_B_inv = _PAWN_CAP_W
 
-# Late-Move-Reduction lookup: R(d, i) = floor(1 + ln(d)*ln(i+1)/2) for d>2, i>2,
 # precomputed so the search never calls math.log.
 _LMR = [[0] * 64 for _ in range(64)]
 for _d in range(3, 64):
@@ -206,46 +166,23 @@ def _idx(r, c):
 class B23CS1001:
     """Alpha-beta agent (fast internal rules copy). Class name = roll number."""
 
-    # ------------------------------------------- time control (self-contained)
-    # Everything the agent needs to budget its own clock lives in THIS file, so
-    # the submission is a genuine single file: the official runner only has to
-    # construct it and call get_best_move().  The tournament gives each player
-    # 1 minute for the whole game (sudden death, no increment) and running out
-    # of time LOSES, so the allocator always keeps a reserve back.
-    #
-    # Scheme (after the usual engine practice: a soft bound the search aims to
-    # finish within, and a hard bound it may extend to when the position turns
     # out to be unstable - "panic time"):
-    #   soft = remaining/moves_left * TIME_FRACTION * criticality
-    #   hard = min(soft * HARD_FACTOR, spendable, remaining*MAX_SHARE_CRIT)
     GAME_SECONDS = 60.0            # 1-minute clock per player
     ASSUMED_MOVES = 75             # assumed total game length for the spread
     MIN_MOVES_LEFT = 8             # divisor floor for the spread
     TIME_FRACTION = 0.90           # share of the clock the game may consume
-    MIN_MOVE_SECONDS = 0.15        # never move instantly
+    MIN_MOVE_SECONDS = 0.30
     HARD_FACTOR = 2.5              # hard bound = soft * this
     MAX_SHARE = 0.25               # one move never takes >25% of the clock
     MAX_SHARE_CRIT = 0.35          # ... nor >35% even in a critical spot
-    # The reserve is deliberately generous and it is a *hard pool*: `_plan_time`
-    # never plans to spend past GAME_SECONDS - RESERVE_SECONDS, and it shares
-    # what is left of that pool over the moves still expected, so a long game
-    # glides into small searches instead of instant ones.  The runner times the
-    # WHOLE get_best_move() call and a time-out loses the game outright (600
-    # points), so the reserve has to cover the abort granularity, per-move
-    # bookkeeping and a loaded machine.  `test_budget.py --stress` plays whole
-    # games on the real clock and fails if any move leaves less than 3.5 s.
     RESERVE_SECONDS = 5.0          # hard pool: never spent (timeout = loss)
-    # Even if that pool is ever exhausted, the search still gets TINY_SLICE per
-    # move - enough for depth 1-2 instead of a move in generation order - and it
-    # may only eat into the reserve down to MIN_RESERVE.  The gap between the two
-    # constants is what covers the abort granularity and per-move bookkeeping.
     TINY_SLICE = 0.02              # seconds: the last-resort move allowance
     MIN_RESERVE = 4.5              # absolute floor: usage <= 60 - MIN_RESERVE
     ITER_PREDICT = 2.5             # projected cost of the next iteration
-    # --- dynamic factors: positional advantage / criticality ---------------
     DRIVE_MULT = 3.0               # we can force mate: +600, the dominant term
     CHECK_MULT = 1.5               # in check: find the escape or lose the king
-    FEW_MULT = 1.2                 # endgame: precision matters
+    FEW_MULT = 1.6                 # endgame: precision matters (the phase that
+                                   # actually decides material and checks)
     WIDE_ROOT = 25                 # this many legal moves = harder choice
     WIDE_MULT = 1.1
     PANIC_DROP = 100               # score fell this much -> think harder
@@ -253,39 +190,14 @@ class B23CS1001:
     EASY_STABILITY = 3             # same best move for N moves with a steady
     EASY_DROP = 30                 # score -> the move is obvious, spend less
     EASY_MULT = 0.5
-    # --- check-avoidance (king pressure) evaluation ------------------------
     PRESS_SCALE = 1                # weight of the king-pressure difference
     PRESS_CAP = 30                 # hard cap (1.5 pawns): never beats material
-    # Check defence.  Pricing checks inside the search was implemented and
-    # REJECTED by measurement: negamax makes the term symmetric, so it also pays
-    # US for giving check, and that trades material for 2-point checks -
-    # interleaved games at 2-4 points lost with material -160 to -400 (mated in
-    # 62-77 plies), against -120/+100 with it disabled.  A bounded asymmetric
-    # root tax on the checking replies we leave (ROOT_CHECK_W = 4) was also
-    # measured and rejected: it does kill the check column (mean check diff
-    # -81 -> -1.5 over 8 interleaved games) but it pays for that by ducking -
-    # material +97.5 -> -27.5, official +16.5 -> -7.0, i.e. a net loss.
-    # What is left is the one trade that costs nothing: exchanging off the
-    # opponent's long-range pieces when we are ahead on points, since an
-    # exchange is material neutral and each rook/bishop removed is a check
-    # source (and a mate threat) removed with it.
-    ROOT_CHECK_W = 0               # score tax per checking reply left available
-    ROOT_CHECK_CAP = 4             # ... capped at this many replies
-    ADJ_TRADE_W = 0                # bonus for an exchange while ahead on points
-    # --- adjudication scorecard (the tournament's points table) ------------
-    # The official scoring is captures at PIECE_VALUES (P20 N70 B70 R100) plus
-    # 2 points for every check GIVEN, a mate is 600 and overrides that table,
-    # and a time-out is a loss.  run_games_fast.py stops a game that is still
-    # running after ADJ_CAP_PLY plies and adjudicates it on the table, which is
-    # how most games against a material-dominant opponent end, so the agent
-    # keeps the exact tally and plays to the score late in the game.
+    DANGER_EVEN = 0.5              # fraction of the danger term at level material
+    DANGER_PRESS_MIN = 8           # tropism threshold for the gate above
+    CHECK_EXT = 1
+    CHECK_EXT_PLY = 5              # ... only this close to the root
+    CHECK_EXT_BUDGET = 6           # ... and at most this many per move
     ADJ_CAP_PLY = 150              # ply at which the harness adjudicates
-    # A check is worth only +2 points while a pawn is 20 and a piece 70-100, so
-    # biasing the search towards checks trades material for small change: paired
-    # games with this at 2 averaged ~80 points of material per game worse than
-    # with it at 0.  The tally and the lead-protection below stay (they are about
-    # not throwing away a lead), but the check bonus is off by default.
-    ADJ_CHECK_PTS = 0              # root bonus per check given (official: 2)
     ADJ_LATE_PLY = 40              # "late" = this close to the cap
     ADJ_LEAD_PTS = 20              # this far ahead/behind late: play to the score
     ADJ_SAFE_PTS = 20              # protect mode: what counts as a real risk
@@ -306,21 +218,17 @@ class B23CS1001:
         self.killers = {}
         self.history = [0] * (48 * 48)
         self.qnodes = 0
-        # Cross-move search history driving the dynamic time control.
         self._last_stability = 0      # consecutive moves with an unchanged best
         self._last_drop = 0           # score drop over the previous move
-        # King-pressure state (check avoidance), maintained incrementally.
         self._press_w = 0             # enemy pressure around the white king
         self._press_b = 0             # enemy pressure around the black king
-        # Adjudication tally (official points table: captures + 2 per check).
         self._adj_ply = 0             # plies already banked
         self._adj_caps = [0, 0]       # [white, black] captured-piece points
         self._adj_chk = [0, 0]        # [white, black] check points (2 each)
         self._adj_mode = 0            # 0 neutral, +1 protect a lead, -1 chase
         self._root_ck = {}            # (from, to) -> does this root move check?
-        self._root_threat = {}        # (from, to) -> checking replies it allows
+        self._ext_left = 0            # check-extension budget for the current move
 
-    # ------------------------------------------------------------- setup
     def _load(self):
         b = []
         for row in self.engine.board:
@@ -328,7 +236,6 @@ class B23CS1001:
                 b.append(_CODE[p])
         self.b = b
         self.wtm = self.engine.white_to_move
-        # Incremental evaluation state (kept in sync on every make/unmake).
         static = 0
         wk = bk = -1
         wnk = bnk = 0
@@ -355,24 +262,14 @@ class B23CS1001:
         self.bnk = bnk
         self.wpow = wpow
         self.bpow = bpow
-        # King pressure (check avoidance): computed once here, then maintained
         # incrementally by _eval_add/_eval_sub.
         self._press_w = self._pressure_on(wk, False)
         self._press_b = self._pressure_on(bk, True)
-        # Official points table (captures + checks) and the late-game mode that
         # follows from it.
         self._load_adj()
 
-    # -------------------------------------------------- adjudication table
     def _load_adj(self):
-        """Keep the official points table exact (captures + 2 per check given).
-
-        A game the harness still sees running after ADJ_CAP_PLY plies is decided
-        on this table, so the agent has to know the score it is playing for.
-        Only the plies not banked yet are read - the opponent's move, plus our
-        own move banked when we picked it - so the cost is a couple of
-        dictionary lookups per move: exact, and nothing that touches the clock.
-        """
+        """Keep the official points table exact (captures + 2 per check given)."""
         log = self.engine.move_log
         if len(log) < self._adj_ply:           # undo, or a brand new game
             self._adj_ply = 0
@@ -383,15 +280,11 @@ class B23CS1001:
             v = _VAL[_CODE[log[i].piece_captured]]
             if v:
                 self._adj_caps[i & 1] += v     # ply 0 is White's move
-            # Only the last ply can still be tested for a delivered check: if we
             # are in check right now, it was that move that gave it.
             if i == n - 1 and self.engine.is_in_check():
                 self._adj_chk[i & 1] += 2
         self._adj_ply = n
 
-        # Play-to-the-score mode: late in a game that will be adjudicated, our
-        # own points are what count, so a lead is worth protecting and a
-        # deficit is worth chasing (a check is +2, a mate is 600).
         self._adj_mode = 0
         if self.ADJ_LEAD_PTS > 0 and self.ADJ_CAP_PLY - n <= self.ADJ_LATE_PLY:
             me = 0 if self.engine.white_to_move else 1
@@ -409,11 +302,7 @@ class B23CS1001:
                 self._adj_caps[1 - me] + self._adj_chk[1 - me])
 
     def _gives_check(self, mv, opk):
-        """Does this move give check?  One attack test, root use only.
-
-        The mover's colour is read from the engine, not from `self.wtm`: the
-        search flips `wtm` while it runs and only `_load` restores it.
-        """
+        """Does this move give check?  One attack test, root use only."""
         if opk < 0:
             return False
         fr = _idx(mv.start_row, mv.start_col)
@@ -428,52 +317,8 @@ class B23CS1001:
         self.b[to] = cap
         return ok
 
-    def _threat_checks(self, fr, to):
-        """How many of the opponent's replies would give check after this move?
-
-        Root-only probe, run once per move (never per node) and used as a bounded
-        score tax on moves that leave our king facing the endless stream of +2
-        checks.  It enumerates the opponent's legal replies in the resulting
-        position and tests each for attacking our king.
-        """
-        b = self.b
-        piece = b[fr]
-        cap = b[to]
-        my_white = self.wtm
-        opp = 'b' if my_white else 'w'
-        myk = self._wk if my_white else self._bk
-        b[to] = piece
-        b[fr] = E
-        if piece == WK or piece == BK:       # our king may have moved itself
-            myk = to
-        self.wtm = not my_white
-        their_king = self._bk if self.wtm else self._wk
-        replies = self._legal_moves(their_king, False, -1, None)
-        count = 0
-        for f2, t2, cap2, _gives in replies:
-            if cap2 == WK or cap2 == BK:
-                continue                     # a king is never captured
-            p2 = b[f2]
-            b[t2] = p2
-            b[f2] = E
-            if myk >= 0 and self._attacked(myk, opp):
-                count += 1
-            b[f2] = p2
-            b[t2] = cap2
-        self.wtm = not self.wtm
-        b[fr] = piece
-        b[to] = cap
-        return count
-
     def _root_hang(self, fr, to):
-        """Value of the piece this move leaves attacked AND undefended.
-
-        Root-only probe on the internal board (a few attack tests per root
-        move, once per move rather than per node), used as a bounded score tax:
-        the eval may still prefer a positional nicety, but not at the price of
-        handing over material.  Kings are excluded (they cannot be captured) and
-        the tax is capped, so a deliberate sacrifice or a mate stays available.
-        """
+        """Value of the piece this move leaves attacked AND undefended."""
         b = self.b
         p = b[fr]
         if p == E:
@@ -494,13 +339,7 @@ class B23CS1001:
         return hang
 
     def _adj_bank(self, mv, opk=-1):
-        """Bank OUR move into the tally (its captures, and a check if any).
-
-        Called on every return path of get_best_move, so the next move has only
-        the opponent's reply left to read.  Everything read here comes from the
-        engine and from the check map built *before* the search started, never
-        from search-mutated state.
-        """
+        """Bank OUR move into the tally (its captures, and a check if any)."""
         me = 0 if self.engine.white_to_move else 1
         v = _VAL[_CODE[mv.piece_captured]]
         if v:
@@ -552,8 +391,6 @@ class B23CS1001:
             else:
                 self.bnk -= 1
                 self.bpow -= _VAL[captured]
-            # A captured piece stops exerting its own pressure on the ENEMY
-            # king (the king squares have not moved yet, so this is exact).
             cek = self._bk if captured < 6 else self._wk
             if cek >= 0 and _PROX[cek][to]:
                 self._press_add(captured, to, -1)
@@ -564,8 +401,6 @@ class B23CS1001:
             self._bk = to
             self._press_b = self._pressure_on(to, True)
         else:
-            # The mover carries its king pressure along with it.  Most moves are
-            # far from the enemy king, where both lookups are 0 and the whole
             # update is a no-op, so it is skipped.
             ek = self._bk if piece < 6 else self._wk
             if ek >= 0 and (_PROX[ek][to] or _PROX[ek][fr]):
@@ -599,15 +434,10 @@ class B23CS1001:
                 self._press_add(piece, fr, 1)
 
     def _position_key(self):
-        # Each square is a 0..10 code, so bytes() is a very fast exact key.
         return (self.wtm, bytes(self.b))
 
-    # ------------------------------------------------------------ public API
     def get_best_move(self):
         engine = self.engine
-        # The clock starts on the FIRST line: the runner times this whole call,
-        # so _load(), root-move generation and per-move overheads have to be
-        # counted here too, or the reserve silently leaks a little each move.
         t0 = time.monotonic()
         self._load()
         root = engine.get_legal_moves()
@@ -617,15 +447,12 @@ class B23CS1001:
 
         # A forced move needs no search at all.
         if len(root) == 1:
-            # It still has to be banked: a forced move can give check (+2).
             self._adj_bank(root[0], self._bk if self.wtm else self._wk)
             self.time_used += time.monotonic() - t0
             return root[0]
 
         moves_done = (len(engine.move_log) + 1) // 2
         myk, opk, in_check, few, drive = self._snapshot()
-        # Dynamic time control: (soft, hard) seconds for this move, derived from
-        # the clock, the game phase and how critical the position is.
         soft, hard = self._plan_time(moves_done, in_check, drive, few, len(root))
         if self.test_budget is not None:
             soft = hard = self.test_budget     # test-harness override only
@@ -634,33 +461,27 @@ class B23CS1001:
         self._deadline = hard_limit
         self._soft_deadline = soft_limit
 
-        # Which root moves give check?  The adjudication table pays 2 points per
-        # check GIVEN, so ADJ_CHECK_PTS is added to that move's root score below.
-        # Computed once per move (never per iteration) and never fed into the
-        # shared eval, so the transposition table stays consistent.
+        # transposition table stays consistent.
         self._root_ck = {}
-        self._root_threat = {}
         if opk >= 0:
             for mv in root:
-                key = (_idx(mv.start_row, mv.start_col),
-                       _idx(mv.end_row, mv.end_col))
-                self._root_ck[key] = self._gives_check(mv, opk)
-                if self.ROOT_CHECK_W:
-                    self._root_threat[key] = self._threat_checks(*key)
+                self._root_ck[(_idx(mv.start_row, mv.start_col),
+                               _idx(mv.end_row, mv.end_col))] = \
+                    self._gives_check(mv, opk)
+        self._ext_left = self.CHECK_EXT_BUDGET
 
         best = None
         prev_score = None
         changes = 0            # root best-move changes during this move
         drop = 0               # score fall over the last iteration
         iter_secs = 0.0        # duration of the last completed iteration
-        limit = soft_limit     # raised to hard_limit while the move is unstable
+        limit = soft_limit
         cap = self.max_depth + (10 if drive else 8 if few else 0)
         try:
             for d in range(1, cap + 1):
                 now = time.monotonic()
                 if now >= hard_limit:
                     break
-                # Do not start an iteration that cannot finish in the budget.
                 if best is not None and \
                         now + iter_secs * self.ITER_PREDICT > limit:
                     break
@@ -679,9 +500,6 @@ class B23CS1001:
                         else 1,
                         self._root_key(m, drive, myk, opk),
                     ))
-                # Aspiration window centred on the last *search* score (the
-                # previous version centred it on the static eval, which made
-                # every root move fail low and silently kept a stale move).
                 half = None if prev_score is None else 80
                 while True:
                     if half is None:
@@ -713,21 +531,6 @@ class B23CS1001:
                         self.b[to] = captured
                         self.wtm = not self.wtm
                         self._eval_sub(piece, fr, to, captured)
-                        if self.ADJ_CHECK_PTS and self._root_ck.get((fr, to)):
-                            score += self.ADJ_CHECK_PTS    # this move banks a check
-                        if self.ROOT_CHECK_W:
-                            # Bounded tax for leaving checking replies available:
-                            # the opponent is paid +2 for every check it lands.
-                            th = self._root_threat.get((fr, to), 0)
-                            if th > self.ROOT_CHECK_CAP:
-                                th = self.ROOT_CHECK_CAP
-                            score -= th * self.ROOT_CHECK_W
-                        if self.ADJ_TRADE_W and self._adj_mode > 0 \
-                                and captured != E and _TYPE[captured] in (3, 4):
-                            # Ahead on points, late: an exchange costs no
-                            # material and removes a rook or bishop, i.e. one of
-                            # the pieces that farm +2 checks and mate threats.
-                            score += self.ADJ_TRADE_W
                         if score > cur_score:
                             cur_score = score
                         if score > alpha:
@@ -758,7 +561,6 @@ class B23CS1001:
                     drop = max(0, score_before - cur_score)
                     if drop >= self.PANIC_DROP:
                         limit = hard_limit
-                # A forced mate for us is already the best possible outcome.
                 if cur_score > MATE_BOUND:
                     break
         except _AbortSearch:
@@ -768,32 +570,18 @@ class B23CS1001:
             self._soft_deadline = None
             self.time_used += time.monotonic() - t0
             self._last_drop = drop
-            # An unchanged root move over consecutive moves = "easy move".
             if changes == 0 and best is not None:
                 self._last_stability += 1
             else:
                 self._last_stability = 0
         if best is None:
             best = root[0]                 # aborted before any move was scored
-        # Bank the move we are about to play into the adjudication tally (its
-        # captures, and its +2 if it gives check), so the next move only has the
         # opponent's reply left to read.
         self._adj_bank(best, opk)
         return best
 
     def _plan_time(self, moves_done, in_check, drive, few, n_root):
-        """Return (soft, hard) seconds for this move - the dynamic time control.
-
-        Sudden death on a 60 s clock: the remaining time is spread over the moves
-        still expected, then scaled by how critical the position looks.  The
-        multipliers encode what this variant rewards - a mate is worth 600, so
-        mate-critical positions (we are driving for mate, or we are in check) get
-        by far the most time, while a position whose best move has not changed
-        for several plies and whose score is steady is treated as obvious and
-        gets less.  `hard` is the ceiling the search may extend to when the root
-        move keeps changing or the score drops (panic time); it is capped so no
-        single move can eat the clock, because running out of time LOSES.
-        """
+        """Return (soft, hard) seconds for this move - the dynamic time control."""
         remaining = max(0.05, self.GAME_SECONDS - self.time_used)
         moves_left = max(self.MIN_MOVES_LEFT, self.ASSUMED_MOVES - moves_done)
         base = remaining * self.TIME_FRACTION / moves_left
@@ -814,19 +602,9 @@ class B23CS1001:
             mult *= self.EASY_MULT         # obvious and stable: move along
 
         reserve = min(self.RESERVE_SECONDS, remaining * 0.5)
-        # Hard pool: the reserve below is never spent, whatever the multipliers
-        # say.  Without this the MAX_SHARE_CRIT crawl spends 35% of whatever is
-        # left on every single move, and no per-move guard can bound that sum -
-        # real games were measured at 59.6 s and 59.1 s of the 60 s clock.
         room = max(0.0, remaining - self.RESERVE_SECONDS)
-        # The floor must scale with the clock, otherwise a fixed minimum would
-        # spend more than half of what is left in a near-empty clock.  It is
         # capped by the pool, so it can never touch the reserve.
         floor = min(self.MIN_MOVE_SECONDS, remaining * 0.1, room)
-        # ... but a move is never free: once the pool is gone the search still
-        # gets a tiny slice, which is enough for depth 1-2 and far better than
-        # returning a move in generation order.  It may only eat into the
-        # reserve down to MIN_RESERVE, which is what covers the abort drift.
         tiny = min(self.TINY_SLICE, max(0.0, remaining - self.MIN_RESERVE))
         if tiny > floor:
             floor = tiny
@@ -843,12 +621,7 @@ class B23CS1001:
         return soft, hard
 
     def _root_key(self, mv, drive, myk, opk):
-        """Root move ordering: mate-drive first, then the adjudication policy.
-
-        Reordering only matters for moves the search scores equally (a root move
-        is kept only on a strict improvement), so this can never give away a
-        tactic or a mate - it just decides which of two equal moves to prefer.
-        """
+        """Root move ordering: mate-drive first, then the adjudication policy."""
         key = 0
         adj = self._adj_mode
         if (drive or adj) and opk >= 0:
@@ -864,8 +637,6 @@ class B23CS1001:
             elif adj < 0 and gives:
                 key -= 20000                   # chasing points: checks are +2
             elif adj > 0 and captured == E:
-                # Protecting a lead: demote a piece left hanging, because that is
-                # exactly how the opponent takes the points back before the cap.
                 if self._root_hang(fr, to) >= self.ADJ_SAFE_PTS:
                     key += 30000 + _VAL[piece]
         cap = self.b[_idx(mv.end_row, mv.end_col)]
@@ -873,7 +644,6 @@ class B23CS1001:
             key -= 100000 + _VAL[cap]
         return key
 
-    # ---------------------------------------------------------------- search
     def _null_move_allowed(self, in_check, depth):
         if in_check or depth < 2:
             return False
@@ -897,7 +667,6 @@ class B23CS1001:
 
         if entry is not None and entry.depth >= depth:
             value = entry.value
-            # Convert the stored node-relative mate score back to root-relative.
             if value > MATE_BOUND:
                 value -= ply
             elif value < -MATE_BOUND:
@@ -915,14 +684,18 @@ class B23CS1001:
                 if value < beta:
                     beta = value
 
-        # Horizon handling runs before the board scan: quiescence and the eval
-        # recompute what they need, so _snapshot is skipped at leaf nodes.
         if depth <= 0:
             return self._quiescence(alpha, beta)
         if ply > self.max_ply:
             return self._evaluate_stm()
 
         myk, opk, in_check, few, drive = self._snapshot()
+
+        # up and steal depth from the quiet positions.
+        if in_check and self.CHECK_EXT and ply <= self.CHECK_EXT_PLY \
+                and self._ext_left > 0:
+            depth += 1
+            self._ext_left -= 1
 
         stand_pat = None
         if not in_check:
@@ -936,9 +709,6 @@ class B23CS1001:
                     score = -ng(depth - 2, -beta, -beta + 1, ply + 1)
                 except _AbortSearch:
                     # Keep make/unmake symmetric on every abort path: an
-                    # unfinished null move must still hand `wtm` back, or the
-                    # caller unwinds with the board and the side to move out of
-                    # step (the qsearch guard and the node-count abort can both
                     # stop the search in here).
                     self.wtm = not self.wtm
                     raise
@@ -950,8 +720,6 @@ class B23CS1001:
         if not legal:
             return -(MATE - ply) if in_check else 0
 
-        # Ordering inputs are hoisted out of the per-move key function (the
-        # killer lookup used to run once per move inside the key lambda).
         killers = self.killers.get(depth, ())
         k0 = killers[0] if killers else -1
         k1 = killers[1] if len(killers) > 1 else -1
@@ -1012,7 +780,6 @@ class B23CS1001:
             self._record_killer(depth, best_move)
             hbonus = depth * depth
             hval = self.history[bmove]
-            # Bounded ("gravity") update keeps early scores from dominating.
             self.history[bmove] = hval + hbonus - hval * hbonus // 16384
         if best_score <= alpha_orig:
             flag = TT_UPPER
@@ -1045,8 +812,7 @@ class B23CS1001:
         return key
 
     def _order_key(self, move, drive, b, tt_fr, tt_to, k0, k1, hist):
-        """Hot ordering key with all lookups pre-resolved by the caller
-        (TT move, killers and history are passed in)."""
+        """Hot ordering key with all lookups pre-resolved by the caller"""
         fr, to, captured, gives = move
         key = 0
         if fr == tt_fr and to == tt_to:
@@ -1074,8 +840,7 @@ class B23CS1001:
             lst.pop()
 
     def _capture_moves(self, ksq, opp, in_check=False):
-        """Legal capture moves only (used by quiescence; avoids generating
-        quiet moves and keeps the delta-pruning friendly 4-tuple shape)."""
+        """Legal capture moves only (used by quiescence; avoids generating"""
         b = self.b
         my_white = self.wtm
         found = []
@@ -1126,8 +891,6 @@ class B23CS1001:
             pinned = 0
             test_all = True
         else:
-            # Same pin shortcut as _legal_moves: only king moves and pinned
-            # pieces can expose the king, so most captures skip the test.
             pinned = self._pinned_squares(ksq, opp)
             test_all = False
         for fr, to, captured in found:
@@ -1146,18 +909,8 @@ class B23CS1001:
         return legal
 
     def _quiescence(self, alpha, beta, qdepth=0):
-        """Forcing-move search: captures, plus full evasions while in check.
-
-        This replaces the old "generate every legal move then filter" version
-        (which paid ~30 attack tests per node for a handful of captures) with a
-        capture-only generator, MVV-LVA ordering and delta pruning.  In check,
-        all evasions are searched so simple mates are still detected at the
-        horizon.
-        """
+        """Forcing-move search: captures, plus full evasions while in check."""
         self.qnodes += 1
-        # Hard-deadline guard for the forcing search: _negamax only tests the
-        # deadline every 255 nodes, so a capture-rich tree at QMAX can overshoot
-        # inside a single node.  The abort is re-raised through the unmake
         # blocks below, exactly like _negamax/root do.
         if self._deadline is not None and (self.qnodes & _ABORT_MASK) == 0 \
                 and time.monotonic() >= self._deadline:
@@ -1166,7 +919,6 @@ class B23CS1001:
         my_white = self.wtm
         my = 'w' if my_white else 'b'
         opp = 'b' if my_white else 'w'
-        # King squares are tracked incrementally (self._wk / self._bk).
         myk = self._wk if my_white else self._bk
         in_check = myk >= 0 and self._attacked(myk, opp)
         stand_pat = self._evaluate_stm()
@@ -1239,14 +991,8 @@ class B23CS1001:
                 return alpha
         return alpha
 
-    # ------------------------------------------------------------- snapshot
     def _snapshot(self):
-        """One-scan board summary used at every search node.
-
-        Returns (my_king, opp_king, in_check, few_pieces, mate_drive).
-        mate_drive is true when the side to move is up by >= a rook against an
-        opponent that has at most one non-king piece left.
-        """
+        """One-scan board summary used at every search node."""
         my_white = self.wtm
         opp = 'b' if my_white else 'w'
         b = self.b
@@ -1281,7 +1027,6 @@ class B23CS1001:
         drive = opp_nk <= 1 and pow_my - pow_opp >= 100
         return myk, opk, in_check, tot <= FEW_PIECE_LIMIT, drive
 
-    # ------------------------------------------------------ attack/legality
     def _find_king(self, color):
         b = self.b
         target = WK if color == 'w' else BK
@@ -1291,11 +1036,7 @@ class B23CS1001:
         return -1
 
     def _attacked(self, sq, by):
-        """Is square `sq` attacked by any piece of colour `by`?
-
-        Uses the precomputed geometry tables (no bounds tests, no _idx calls),
-        which is the single hottest helper in the search.
-        """
+        """Is square `sq` attacked by any piece of colour `by`?"""
         b = self.b
         if by == 'w':
             pn = WN
@@ -1336,8 +1077,7 @@ class B23CS1001:
         return False
 
     def _pinned_squares(self, ksq, opp):
-        """Bitmask of own pieces standing between the king and an enemy slider
-        (only these quiet moves can ever expose the king)."""
+        """Bitmask of own pieces standing between the king and an enemy slider"""
         b = self.b
         pinned = 0
         opp_white = opp == 'w'
@@ -1372,13 +1112,7 @@ class B23CS1001:
         return pinned
 
     def _legal_moves(self, ksq, drive=False, opk=-1, in_check=None):
-        """Legal moves as (from, to, captured, gives_check) tuples.
-
-        Rules mirror board.py exactly (generate-then-validate); the king of the
-        side that just moved must not be left in check.  When `drive` is set we
-        additionally record whether each move gives check (mate-drive needs to
-        order forcing moves first).
-        """
+        """Legal moves as (from, to, captured, gives_check) tuples."""
         b = self.b
         my_white = self.wtm
         my = 'w' if my_white else 'b'
@@ -1437,8 +1171,6 @@ class B23CS1001:
             for fr, to in pseudo:
                 legal.append((fr, to, b[to], False))
             return legal
-        # Only king moves and pinned-piece moves can expose the king, so when
-        # not in check (and not driving for mate, which needs `gives`) the
         # expensive attack test is skipped for every other move.
         if in_check is None:
             in_check = self._attacked(ksq, opp)
@@ -1464,23 +1196,13 @@ class B23CS1001:
                 legal.append((fr, to, captured, gives))
         return legal
 
-    # --------------------------------------------------------- evaluation
     def _evaluate_stm(self):
         v = self._evaluate_white()
         return v if self.wtm else -v
 
     def _evaluate_white(self):
-        """Static evaluation (white-positive), O(1) in the midgame.
-
-        Material + piece-square tables dominate (they mirror the tournament
-        scoring), with small centralisation, passed-pawn and king-safety terms.
-        The material/PST/centre part and the king squares are maintained
-        incrementally on every make/unmake (see `_load`); only the endgame
-        passed-pawn scan touches the board.
-        """
+        """Static evaluation (white-positive), O(1) in the midgame."""
         b = self.b
-        # Everything below is maintained incrementally (see _load / make-unmake),
-        # so the common midgame evaluation is O(1) - no 48-square scan.
         score = self._static
         w_king = self._wk
         b_king = self._bk
@@ -1490,7 +1212,6 @@ class B23CS1001:
         b_pow = self.bpow
         nk = w_nk + b_nk
         if nk <= 12:
-            # Passed-pawn scan (endgame only), so the common midgame eval never
             # has to collect pawn squares.
             for i in range(48):
                 p = b[i]
@@ -1526,7 +1247,6 @@ class B23CS1001:
                 score += KING_PST[wr][wc]
                 score -= KING_PST[BH - 1 - br][bc]
             else:
-                # King shield (inlined): friendly pawns in front of each king.
                 rr = wr - 1
                 if rr >= 0:
                     base = rr * BW
@@ -1546,11 +1266,6 @@ class B23CS1001:
                     if bc + 1 < BW and b[base + bc + 1] == BP:
                         score -= 6
 
-        # Check avoidance: enemy material near a king is what generates the
-        # endless stream of +2 checks (and then the mates).  Bounded by
-        # PRESS_CAP and only counted while the attacker still has real material,
-        # so it can never outweigh material - and never a mate, because a mate
-        # score is ~100000 and always overrules any evaluation term.
         press = 0
         if w_nk >= 2:                     # white attacks the black king
             press += self._press_b
@@ -1568,23 +1283,22 @@ class B23CS1001:
         elif b_pow - w_pow >= 100 and w_nk <= 1 and w_king >= 0 \
                 and b_king >= 0:
             score -= self._drive_bonus('b', b_king, w_king)
-        # Defensive drive: the case the bonus above does *not* cover, i.e. the
-        # trailing side still has two or more non-king pieces.  Losing a king is
-        # worth 600, so a boxed-in king is penalised well before the endgame has
-        # been stripped down to a bare king.
+        # a mate just as easily as a material-down one.
         if w_king >= 0 and b_king >= 0:
-            if b_pow - w_pow >= 100 and w_nk >= 2:
-                score -= self._king_danger(w_king, 'b')
-            elif w_pow - b_pow >= 100 and b_nk >= 2:
-                score += self._king_danger(b_king, 'w')
-        # Expose the king squares so quiescence does not need a second scan.
+            if b_nk >= 2 and (b_pow - w_pow >= 100
+                              or self._edge_danger(w_king, self._press_w)):
+                d = self._king_danger(w_king, 'b')
+                score -= d if b_pow - w_pow >= 100 else int(d * self.DANGER_EVEN)
+            if w_nk >= 2 and (w_pow - b_pow >= 100
+                              or self._edge_danger(b_king, self._press_b)):
+                d = self._king_danger(b_king, 'w')
+                score += d if w_pow - b_pow >= 100 else int(d * self.DANGER_EVEN)
         self._wk = w_king
         self._bk = b_king
         return score
 
     def _drive_bonus(self, leader, lk, ek):
-        """Positive score (for `leader`) pushing the enemy king to the edge
-        while the leader's king and rook(s) move in for the mate."""
+        """Positive score (for `leader`) pushing the enemy king to the edge"""
         b = self.b
         er, ec = divmod(ek, BW)
         lr, lc = divmod(lk, BW)
@@ -1615,16 +1329,17 @@ class B23CS1001:
         score += 40 * cuts
         return score
 
-    def _king_danger(self, ksq, opp):
-        """How endangered a king is while `opp` is the side with mating material.
+    def _edge_danger(self, ksq, press):
+        """Cheap O(1) gate for `_king_danger`, which scans rays and flight squares."""
+        if ksq < 0:
+            return False
+        kr, kc = divmod(ksq, BW)
+        if 1 < kr < BH - 2 and 1 < kc < BW - 2:
+            return False                     # safely in the middle
+        return press >= self.DANGER_PRESS_MIN
 
-        Defensive counterpart of `_drive_bonus`: only *defensive* facts are
-        scored (edge proximity, escape squares, cut-off enemy rooks), because the
-        attacker's incentives (bring my king near, cut with rooks) are already
-        supplied by `_drive_bonus`.  The escape-square count is the part that
-        catches a mate that is one tempo away; it is only paid for near an edge,
-        where being boxed in can actually matter.
-        """
+    def _king_danger(self, ksq, opp):
+      
         b = self.b
         kr, kc = divmod(ksq, BW)
         rowd = min(kr, BH - 1 - kr)
