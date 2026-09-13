@@ -141,11 +141,22 @@ class B23ME1074:
         ordered = sorted(legal, key=lambda move: move != previous)
         alpha = -self.INF
         best = ordered[0]
+        first = True
         for move in ordered:
             self._check_deadline()
             position.make_move(move)
             try:
-                value = -self._negamax(depth - 1, -self.INF, -alpha, 1)
+                if first:
+                    value = -self._negamax(depth - 1, -self.INF, -alpha, 1)
+                    first = False
+                else:
+                    # Most root moves are expected to be worse than the
+                    # current principal variation. Use a zero-width window
+                    # first and re-search only moves that beat alpha.
+                    value = -self._negamax(depth - 1, -alpha - 1, -alpha, 1)
+                    if value > alpha and value < self.INF:
+                        value = -self._negamax(depth - 1, -self.INF,
+                                              -alpha, 1)
             finally:
                 position.undo_move()
             if value > alpha:
@@ -201,10 +212,12 @@ class B23ME1074:
             if alpha >= beta:
                 if move.piece_captured == "--":
                     killers = self._killers.setdefault(ply, [])
-                    if best_key not in killers:
-                        killers.insert(0, best_key)
+                    move_key = self._move_key(move)
+                    if move_key not in killers:
+                        killers.insert(0, move_key)
                         del killers[2:]
-                    hkey = (move.piece_moved, best_key)
+                    # The cutoff move is the useful quiet-move ordering signal.
+                    hkey = (move.piece_moved, move_key)
                     self._history[hkey] = min(
                         10_000, self._history.get(hkey, 0) + depth * depth)
                 break
@@ -383,6 +396,14 @@ class B23ME1074:
                             safety += 14
                 value += phase * safety + (1 - phase) * (35 - 10 * center)
             scores[side] += value
+        # The official scoring awards a small bonus for delivering check.
+        # It remains subordinate to material and mate, but breaks otherwise
+        # equal leaf evaluations in favor of useful checking moves.
+        if position.is_in_check():
+            if position.white_to_move:
+                scores[1] += 20
+            else:
+                scores[0] += 20
         # In a materially won sparse ending, bring our king closer and
         # drive the opposing king toward an edge to help finish checkmate.
         difference = material[0] - material[1]
@@ -398,3 +419,4 @@ class B23ME1074:
                     25 * (min(height, width) / 2 - edge_distance)
                     + 12 * (max(height, width) - distance))
         return int(round(scores[0] - scores[1]))
+
