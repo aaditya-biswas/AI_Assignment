@@ -93,8 +93,8 @@ def play(white_cls, black_cls):
 
 def main():
     for pair in [
-                 (B23CS1001, AIPlayer), (AIPlayer, B23CS1001), (B23CS1001, B23ME1074),
-                 (B23ME1074, B23CS1001), ]:
+                 (B23CS1001, B23ME1074), (B23ME1074, B23CS1001), (B23ES1030, B23ME1074),
+                 (B23ME1074, B23ES1030), ]:
         play(*pair)
     print("FAST GAUNTLET DONE", flush=True)
 

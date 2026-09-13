@@ -139,6 +139,12 @@ for _r in range(BH):
 
 MATE_BOUND = MATE - 1000   # scores beyond this encode mate distances
 QMAX = 6                   # quiescence depth cap
+_ABORT_MASK = 15           # test the hard deadline every 16 nodes.  The drift a
+                           # move overshoots by is what eats the clock reserve
+                           # over a long game, and it scales with NPS: at 255
+                           # nodes it was ~2 s per game even under CPU load,
+                           # against ~0.6 s here.  One time.monotonic() per 16
+                           # nodes is well under 0.1% of the run time.
 
 # Inverse pawn tables: the squares a white/black pawn would have to stand on in
 # order to attack a given square (same geometry as the opposite pawn's captures).
@@ -183,9 +189,25 @@ class B23CS1001:
     TIME_FRACTION = 0.75           # share of the clock the game may consume
     MIN_MOVE_SECONDS = 0.15        # never move instantly
     HARD_FACTOR = 2.5              # hard bound = soft * this
+    GLIDE_PANIC = 1.75             # ... and soft never exceeds this share of the
+                                   # pool left per remaining move
     MAX_SHARE = 0.25               # one move never takes >25% of the clock
     MAX_SHARE_CRIT = 0.35          # ... nor >35% even in a critical spot
-    RESERVE_SECONDS = 2.0          # always keep this much back (timeout = loss)
+    # The reserve is deliberately generous and it is a *hard pool*: `_plan_time`
+    # never plans to spend past GAME_SECONDS - RESERVE_SECONDS, and it shares
+    # what is left of that pool over the moves still expected, so a long game
+    # glides into small searches instead of instant ones.  The runner times the
+    # WHOLE get_best_move() call and a time-out loses the game outright (600
+    # points), so the reserve has to cover the abort granularity, per-move
+    # bookkeeping and a loaded machine.  `test_budget.py --stress` plays whole
+    # games on the real clock and fails if any move leaves less than 3.5 s.
+    RESERVE_SECONDS = 5.0          # hard pool: never spent (timeout = loss)
+    # Even if that pool is ever exhausted, the search still gets TINY_SLICE per
+    # move - enough for depth 1-2 instead of a move in generation order - and it
+    # may only eat into the reserve down to MIN_RESERVE.  The gap between the two
+    # constants is what covers the abort granularity and per-move bookkeeping.
+    TINY_SLICE = 0.02              # seconds: the last-resort move allowance
+    MIN_RESERVE = 4.5              # absolute floor: usage <= 60 - MIN_RESERVE
     ITER_PREDICT = 2.5             # projected cost of the next iteration
     # --- dynamic factors: positional advantage / criticality ---------------
     DRIVE_MULT = 3.0               # we can force mate: +600, the dominant term
@@ -201,6 +223,18 @@ class B23CS1001:
     # --- check-avoidance (king pressure) evaluation ------------------------
     PRESS_SCALE = 1                # weight of the king-pressure difference
     PRESS_CAP = 30                 # hard cap (1.5 pawns): never beats material
+    # --- adjudication scorecard (the tournament's points table) ------------
+    # The official scoring is captures at PIECE_VALUES (P20 N70 B70 R100) plus
+    # 2 points for every check GIVEN, a mate is 600 and overrides that table,
+    # and a time-out is a loss.  run_games_fast.py stops a game that is still
+    # running after ADJ_CAP_PLY plies and adjudicates it on the table, which is
+    # how most games against a material-dominant opponent end, so the agent
+    # keeps the exact tally and plays to the score late in the game.
+    ADJ_CAP_PLY = 150              # ply at which the harness adjudicates
+    ADJ_CHECK_PTS = 2              # root bonus per check given (official: 2)
+    ADJ_LATE_PLY = 40              # "late" = this close to the cap
+    ADJ_LEAD_PTS = 20              # this far ahead/behind late: play to the score
+    ADJ_SAFE_PTS = 20              # protect mode: what counts as a real risk
 
     def __init__(self, engine, depth=6, max_depth=12):
         self.engine = engine
@@ -224,6 +258,12 @@ class B23CS1001:
         # King-pressure state (check avoidance), maintained incrementally.
         self._press_w = 0             # enemy pressure around the white king
         self._press_b = 0             # enemy pressure around the black king
+        # Adjudication tally (official points table: captures + 2 per check).
+        self._adj_ply = 0             # plies already banked
+        self._adj_caps = [0, 0]       # [white, black] captured-piece points
+        self._adj_chk = [0, 0]        # [white, black] check points (2 each)
+        self._adj_mode = 0            # 0 neutral, +1 protect a lead, -1 chase
+        self._root_ck = {}            # (from, to) -> does this root move check?
 
     # ------------------------------------------------------------- setup
     def _load(self):
@@ -264,6 +304,94 @@ class B23CS1001:
         # incrementally by _eval_add/_eval_sub.
         self._press_w = self._pressure_on(wk, False)
         self._press_b = self._pressure_on(bk, True)
+        # Official points table (captures + checks) and the late-game mode that
+        # follows from it.
+        self._load_adj()
+
+    # -------------------------------------------------- adjudication table
+    def _load_adj(self):
+        """Keep the official points table exact (captures + 2 per check given).
+
+        A game the harness still sees running after ADJ_CAP_PLY plies is decided
+        on this table, so the agent has to know the score it is playing for.
+        Only the plies not banked yet are read - the opponent's move, plus our
+        own move banked when we picked it - so the cost is a couple of
+        dictionary lookups per move: exact, and nothing that touches the clock.
+        """
+        log = self.engine.move_log
+        if len(log) < self._adj_ply:           # undo, or a brand new game
+            self._adj_ply = 0
+            self._adj_caps = [0, 0]
+            self._adj_chk = [0, 0]
+        n = len(log)
+        for i in range(self._adj_ply, n):
+            v = _VAL[_CODE[log[i].piece_captured]]
+            if v:
+                self._adj_caps[i & 1] += v     # ply 0 is White's move
+            # Only the last ply can still be tested for a delivered check: if we
+            # are in check right now, it was that move that gave it.
+            if i == n - 1 and self.engine.is_in_check():
+                self._adj_chk[i & 1] += 2
+        self._adj_ply = n
+
+        # Play-to-the-score mode: late in a game that will be adjudicated, our
+        # own points are what count, so a lead is worth protecting and a
+        # deficit is worth chasing (a check is +2, a mate is 600).
+        self._adj_mode = 0
+        if self.ADJ_LEAD_PTS > 0 and self.ADJ_CAP_PLY - n <= self.ADJ_LATE_PLY:
+            me = 0 if self.engine.white_to_move else 1
+            lead = (self._adj_caps[me] + self._adj_chk[me]) - \
+                   (self._adj_caps[1 - me] + self._adj_chk[1 - me])
+            if lead >= self.ADJ_LEAD_PTS:
+                self._adj_mode = 1
+            elif lead <= -self.ADJ_LEAD_PTS:
+                self._adj_mode = -1
+
+    def _adj_points(self):
+        """Official points banked so far, as (ours, theirs)."""
+        me = 0 if self.engine.white_to_move else 1
+        return (self._adj_caps[me] + self._adj_chk[me],
+                self._adj_caps[1 - me] + self._adj_chk[1 - me])
+
+    def _gives_check(self, mv, opk):
+        """Does this move give check?  One attack test, root use only.
+
+        The mover's colour is read from the engine, not from `self.wtm`: the
+        search flips `wtm` while it runs and only `_load` restores it.
+        """
+        if opk < 0:
+            return False
+        fr = _idx(mv.start_row, mv.start_col)
+        to = _idx(mv.end_row, mv.end_col)
+        piece = self.b[fr]
+        cap = self.b[to]
+        self.b[to] = piece
+        self.b[fr] = E
+        nk = to if to == opk else opk
+        ok = self._attacked(nk, 'w' if self.engine.white_to_move else 'b')
+        self.b[fr] = piece
+        self.b[to] = cap
+        return ok
+
+    def _adj_bank(self, mv, opk=-1):
+        """Bank OUR move into the tally (its captures, and a check if any).
+
+        Called on every return path of get_best_move, so the next move has only
+        the opponent's reply left to read.  Everything read here comes from the
+        engine and from the check map built *before* the search started, never
+        from search-mutated state.
+        """
+        me = 0 if self.engine.white_to_move else 1
+        v = _VAL[_CODE[mv.piece_captured]]
+        if v:
+            self._adj_caps[me] += v
+        key = (_idx(mv.start_row, mv.start_col), _idx(mv.end_row, mv.end_col))
+        gives = self._root_ck.get(key)
+        if gives is None:
+            gives = self._gives_check(mv, opk)
+        if gives:
+            self._adj_chk[me] += 2
+        self._adj_ply = len(self.engine.move_log) + 1
 
     def _pressure_on(self, ksq, by_white):
         """From-scratch king pressure: enemy material near the king (tropism)."""
@@ -357,14 +485,20 @@ class B23CS1001:
     # ------------------------------------------------------------ public API
     def get_best_move(self):
         engine = self.engine
+        # The clock starts on the FIRST line: the runner times this whole call,
+        # so _load(), root-move generation and per-move overheads have to be
+        # counted here too, or the reserve silently leaks a little each move.
+        t0 = time.monotonic()
         self._load()
         root = engine.get_legal_moves()
         if not root:
+            self.time_used += time.monotonic() - t0
             return None
 
-        t0 = time.monotonic()
         # A forced move needs no search at all.
         if len(root) == 1:
+            # It still has to be banked: a forced move can give check (+2).
+            self._adj_bank(root[0], self._bk if self.wtm else self._wk)
             self.time_used += time.monotonic() - t0
             return root[0]
 
@@ -379,6 +513,17 @@ class B23CS1001:
         hard_limit = t0 + hard
         self._deadline = hard_limit
         self._soft_deadline = soft_limit
+
+        # Which root moves give check?  The adjudication table pays 2 points per
+        # check GIVEN, so ADJ_CHECK_PTS is added to that move's root score below.
+        # Computed once per move (never per iteration) and never fed into the
+        # shared eval, so the transposition table stays consistent.
+        self._root_ck = {}
+        if opk >= 0:
+            for mv in root:
+                self._root_ck[(_idx(mv.start_row, mv.start_col),
+                               _idx(mv.end_row, mv.end_col))] = \
+                    self._gives_check(mv, opk)
 
         best = None
         prev_score = None
@@ -445,6 +590,8 @@ class B23CS1001:
                         self.b[to] = captured
                         self.wtm = not self.wtm
                         self._eval_sub(piece, fr, to, captured)
+                        if self.ADJ_CHECK_PTS and self._root_ck.get((fr, to)):
+                            score += self.ADJ_CHECK_PTS    # this move banks a check
                         if score > cur_score:
                             cur_score = score
                         if score > alpha:
@@ -490,7 +637,13 @@ class B23CS1001:
                 self._last_stability += 1
             else:
                 self._last_stability = 0
-        return best if best is not None else root[0]
+        if best is None:
+            best = root[0]                 # aborted before any move was scored
+        # Bank the move we are about to play into the adjudication tally (its
+        # captures, and its +2 if it gives check), so the next move only has the
+        # opponent's reply left to read.
+        self._adj_bank(best, opk)
+        return best
 
     def _plan_time(self, moves_done, in_check, drive, few, n_root):
         """Return (soft, hard) seconds for this move - the dynamic time control.
@@ -525,34 +678,75 @@ class B23CS1001:
             mult *= self.EASY_MULT         # obvious and stable: move along
 
         reserve = min(self.RESERVE_SECONDS, remaining * 0.5)
+        # Hard pool: the reserve below is never spent, whatever the multipliers
+        # say.  Without this the MAX_SHARE_CRIT crawl spends 35% of whatever is
+        # left on every single move, and no per-move guard can bound that sum -
+        # real games were measured at 59.6 s and 59.1 s of the 60 s clock.
+        room = max(0.0, remaining - self.RESERVE_SECONDS)
+        # Share that pool fairly over the moves still expected, so the
+        # multipliers cannot drain it early and leave the end of a long game
+        # with no time to think at all.  The panic allowance on top lets a
+        # genuinely critical move spend more than its share (and self-corrects,
+        # because the share is recomputed from what is actually left).
+        glide = room / moves_left
         # The floor must scale with the clock, otherwise a fixed minimum would
-        # spend more than half of what is left in a near-empty clock and could
-        # lose on time.  Together with MAX_SHARE_CRIT this guarantees that no
-        # move ever takes more than half of the remaining time.
-        floor = min(self.MIN_MOVE_SECONDS, remaining * 0.1)
-        spendable = max(floor, remaining - reserve)
+        # spend more than half of what is left in a near-empty clock.  It is
+        # capped by the pool, so it can never touch the reserve.
+        floor = min(self.MIN_MOVE_SECONDS, remaining * 0.1, room)
+        # ... but a move is never free: once the pool is gone the search still
+        # gets a tiny slice, which is enough for depth 1-2 and far better than
+        # returning a move in generation order.  It may only eat into the
+        # reserve down to MIN_RESERVE, which is what covers the abort drift.
+        tiny = min(self.TINY_SLICE, max(0.0, remaining - self.MIN_RESERVE))
+        if tiny > floor:
+            floor = tiny
+        spendable = max(floor, min(remaining - reserve, room))
         soft = max(floor, min(base * mult, spendable,
-                              remaining * self.MAX_SHARE))
+                              remaining * self.MAX_SHARE,
+                              glide * self.GLIDE_PANIC))
         hard = max(soft, min(soft * self.HARD_FACTOR, spendable,
                              remaining * self.MAX_SHARE_CRIT))
+        guard = max(0.0, remaining - self.MIN_RESERVE)
+        if hard > guard:                # absolute floor: never spent
+            hard = guard
+        if soft > hard:
+            soft = hard
         return soft, hard
 
     def _root_key(self, mv, drive, myk, opk):
-        """Root move ordering: in mate-drive prefer checks, then captures."""
+        """Root move ordering: mate-drive first, then the adjudication policy.
+
+        Reordering only matters for moves the search scores equally (a root move
+        is kept only on a strict improvement), so this can never give away a
+        tactic or a mate - it just decides which of two equal moves to prefer.
+        """
         key = 0
-        if drive and opk >= 0:
+        adj = self._adj_mode
+        if (drive or adj) and opk >= 0:
             my = 'w' if self.wtm else 'b'
             fr = _idx(mv.start_row, mv.start_col)
             to = _idx(mv.end_row, mv.end_col)
             piece = self.b[fr]
             captured = self.b[to]
-            self.b[to] = piece
-            self.b[fr] = E
-            nk = to if to == opk else opk
-            if nk >= 0 and self._attacked(nk, my):
+            gives = self._root_ck.get((fr, to))
+            if gives is None:                  # map not built: test it directly
+                gives = self._gives_check(mv, opk)
+            if drive and gives:
                 key -= 200000
-            self.b[fr] = piece
-            self.b[to] = captured
+            elif adj < 0 and gives:
+                key -= 20000                   # chasing points: checks are +2
+            elif adj > 0 and captured == E:
+                # Protecting a lead: demote a piece left hanging (attacked by
+                # them, not defended by us), because that is exactly how the
+                # opponent takes the points back before the cap.
+                self.b[to] = piece
+                self.b[fr] = E
+                opp = 'b' if my == 'w' else 'w'
+                hung = self._attacked(to, opp) and not self._attacked(to, my)
+                self.b[fr] = piece
+                self.b[to] = captured
+                if hung and _VAL[piece] >= self.ADJ_SAFE_PTS:
+                    key += 30000 + _VAL[piece]
         cap = self.b[_idx(mv.end_row, mv.end_col)]
         if cap != E:
             key -= 100000 + _VAL[cap]
@@ -572,7 +766,7 @@ class B23CS1001:
         ng = self._negamax          # local binding speeds up recursion
         self.nodes_expanded += 1
 
-        if (self.nodes_expanded & 255) == 0 and self._deadline is not None \
+        if (self.nodes_expanded & _ABORT_MASK) == 0 and self._deadline is not None \
             and time.monotonic() >= self._deadline:
             raise _AbortSearch()
 
@@ -617,7 +811,16 @@ class B23CS1001:
                     return stand_pat
             if self._null_move_allowed(in_check, depth):
                 self.wtm = not self.wtm
-                score = -ng(depth - 2, -beta, -beta + 1, ply + 1)
+                try:
+                    score = -ng(depth - 2, -beta, -beta + 1, ply + 1)
+                except _AbortSearch:
+                    # Keep make/unmake symmetric on every abort path: an
+                    # unfinished null move must still hand `wtm` back, or the
+                    # caller unwinds with the board and the side to move out of
+                    # step (the qsearch guard and the node-count abort can both
+                    # stop the search in here).
+                    self.wtm = not self.wtm
+                    raise
                 self.wtm = not self.wtm
                 if score >= beta:
                     return beta
@@ -831,6 +1034,13 @@ class B23CS1001:
         horizon.
         """
         self.qnodes += 1
+        # Hard-deadline guard for the forcing search: _negamax only tests the
+        # deadline every 255 nodes, so a capture-rich tree at QMAX can overshoot
+        # inside a single node.  The abort is re-raised through the unmake
+        # blocks below, exactly like _negamax/root do.
+        if self._deadline is not None and (self.qnodes & _ABORT_MASK) == 0 \
+                and time.monotonic() >= self._deadline:
+            raise _AbortSearch
         b = self.b
         my_white = self.wtm
         my = 'w' if my_white else 'b'
@@ -853,7 +1063,14 @@ class B23CS1001:
                 b[fr] = E
                 self.wtm = not self.wtm
                 self._eval_add(piece, fr, to, captured)
-                score = -self._quiescence(-beta, -alpha, qdepth + 1)
+                try:
+                    score = -self._quiescence(-beta, -alpha, qdepth + 1)
+                except _AbortSearch:
+                    b[fr] = piece      # restore before unwinding (_negamax-style)
+                    b[to] = captured
+                    self.wtm = not self.wtm
+                    self._eval_sub(piece, fr, to, captured)
+                    raise
                 b[fr] = piece
                 b[to] = captured
                 self.wtm = not self.wtm
@@ -883,7 +1100,14 @@ class B23CS1001:
             b[fr] = E
             self.wtm = not self.wtm
             self._eval_add(piece, fr, to, captured)
-            score = -self._quiescence(-beta, -alpha, qdepth + 1)
+            try:
+                score = -self._quiescence(-beta, -alpha, qdepth + 1)
+            except _AbortSearch:
+                b[fr] = piece          # restore before unwinding (_negamax-style)
+                b[to] = captured
+                self.wtm = not self.wtm
+                self._eval_sub(piece, fr, to, captured)
+                raise
             b[fr] = piece
             b[to] = captured
             self.wtm = not self.wtm
