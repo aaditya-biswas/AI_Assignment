@@ -17,7 +17,7 @@ TT_EXACT = 0
 TT_LOWER = 1
 TT_UPPER = 2
 
-# where the search spends most of its time.
+# Piece codes: 0 = empty, 1-5 white, 6-10 black (code < 6 = white).
 E = 0
 WP, WN, WB, WR, WK = 1, 2, 3, 4, 5
 BP, BN, BB, BR, BK = 6, 7, 8, 9, 10
@@ -137,12 +137,8 @@ for _r in range(BH):
 
 MATE_BOUND = MATE - 1000   # scores beyond this encode mate distances
 QMAX = 6                   # quiescence depth cap
-_ABORT_MASK = 15
-                           # move overshoots by is what eats the clock reserve
-                           # over a long game, and it scales with NPS: at 255
-                           # nodes it was ~2 s per game even under CPU load,
-                           # against ~0.6 s here.  One time.monotonic() per 16
-                           # nodes is well under 0.1% of the run time.
+_ABORT_MASK = 15           # clock read every 16 nodes, so the overshoot
+                           # stays far below the RESERVE_SECONDS pool
 
 _PAWN_CAP_W_inv = _PAWN_CAP_B
 _PAWN_CAP_B_inv = _PAWN_CAP_W
@@ -164,9 +160,14 @@ def _idx(r, c):
 
 
 class B23CS1001:
-    """Alpha-beta agent (fast internal rules copy). Class name = roll number."""
+    """Alpha-beta agent (own integer board, own legal-move rules).
 
-    # out to be unstable - "panic time"):
+    Per move: build the integer board, plan a soft/hard time budget, then
+    search iterative-deepening negamax (PVS + TT + null move + LMR +
+    quiescence) over the engines own legal root moves.  The class name
+    is the roll number and the file imports nothing but config.
+    """
+
     GAME_SECONDS = 60.0            # 1-minute clock per player
     ASSUMED_MOVES = 75             # assumed total game length for the spread
     MIN_MOVES_LEFT = 8             # divisor floor for the spread
@@ -262,10 +263,10 @@ class B23CS1001:
         self.bnk = bnk
         self.wpow = wpow
         self.bpow = bpow
-        # incrementally by _eval_add/_eval_sub.
+        # Both values are then maintained incrementally by _eval_add/
+        # _eval_sub until a king actually moves (kings move rarely).
         self._press_w = self._pressure_on(wk, False)
         self._press_b = self._pressure_on(bk, True)
-        # follows from it.
         self._load_adj()
 
     def _load_adj(self):
@@ -280,7 +281,8 @@ class B23CS1001:
             v = _VAL[_CODE[log[i].piece_captured]]
             if v:
                 self._adj_caps[i & 1] += v     # ply 0 is White's move
-            # are in check right now, it was that move that gave it.
+            # The engine logs no check flags, so only the last move can be
+            # credited: if we are in check now, that move gave it.
             if i == n - 1 and self.engine.is_in_check():
                 self._adj_chk[i & 1] += 2
         self._adj_ply = n
@@ -401,7 +403,8 @@ class B23CS1001:
             self._bk = to
             self._press_b = self._pressure_on(to, True)
         else:
-            # update is a no-op, so it is skipped.
+            # Guarded by _PROX: if the piece is out of range of the enemy
+            # king on both squares, the whole update is skipped.
             ek = self._bk if piece < 6 else self._wk
             if ek >= 0 and (_PROX[ek][to] or _PROX[ek][fr]):
                 self._press_add(piece, to, 1)
@@ -461,7 +464,8 @@ class B23CS1001:
         self._deadline = hard_limit
         self._soft_deadline = soft_limit
 
-        # transposition table stays consistent.
+        # Cache "does this root move give check?" for this move only; it feeds
+        # the root ordering (mate drive, adjudication modes) and _adj_bank.
         self._root_ck = {}
         if opk >= 0:
             for mv in root:
@@ -500,6 +504,9 @@ class B23CS1001:
                         else 1,
                         self._root_key(m, drive, myk, opk),
                     ))
+                # Iteration 1 searches the full window; later iterations use an
+                # aspiration window of +-80 (0.8 pawn), widened x4 and
+                # re-searched on a fail low / fail high.
                 half = None if prev_score is None else 80
                 while True:
                     if half is None:
@@ -576,7 +583,7 @@ class B23CS1001:
                 self._last_stability = 0
         if best is None:
             best = root[0]                 # aborted before any move was scored
-        # opponent's reply left to read.
+        # Bank our own move now; the reply is read by the next call.
         self._adj_bank(best, opk)
         return best
 
@@ -603,7 +610,8 @@ class B23CS1001:
 
         reserve = min(self.RESERVE_SECONDS, remaining * 0.5)
         room = max(0.0, remaining - self.RESERVE_SECONDS)
-        # capped by the pool, so it can never touch the reserve.
+        # The floor is capped by the spendable pool, so it can never touch the
+        # reserve; TINY_SLICE keeps a legal move reachable even at 1 s left.
         floor = min(self.MIN_MOVE_SECONDS, remaining * 0.1, room)
         tiny = min(self.TINY_SLICE, max(0.0, remaining - self.MIN_RESERVE))
         if tiny > floor:
@@ -664,7 +672,9 @@ class B23CS1001:
         key = self._position_key()
         entry = self.tt.get(key)
         tt_move = None if entry is None else entry.best_move
-
+        # Mate scores are stored relative to the node, so they must be re-based by
+        # ply on the way in and out - otherwise a mate in 5 stored near the root
+        # would look better than a mate in 1 found deeper in the tree.
         if entry is not None and entry.depth >= depth:
             value = entry.value
             if value > MATE_BOUND:
@@ -686,12 +696,13 @@ class B23CS1001:
 
         if depth <= 0:
             return self._quiescence(alpha, beta)
-        if ply > self.max_ply:
+        if ply > self.max_ply:          # safety valve, not normally reached
             return self._evaluate_stm()
 
         myk, opk, in_check, few, drive = self._snapshot()
 
-        # up and steal depth from the quiet positions.
+        # Check extension (bounded): one extra ply while a check is being
+        # resolved, only within CHECK_EXT_PLY of the root and budgeted.
         if in_check and self.CHECK_EXT and ply <= self.CHECK_EXT_PLY \
                 and self._ext_left > 0:
             depth += 1
@@ -699,17 +710,21 @@ class B23CS1001:
 
         stand_pat = None
         if not in_check:
+            # Reverse futility: at low depth a static score already 120*depth
+            # above beta is assumed to be a cut-off (cheapest pruning here).
             if depth <= 3:
                 stand_pat = self._evaluate_stm()
                 if stand_pat - 120 * depth >= beta:
                     return stand_pat
+            # Null move: hand the opponent a free move; if even that beats beta
+            # this node is too good to be true.  Reduced by 2, minimal window.
             if self._null_move_allowed(in_check, depth):
                 self.wtm = not self.wtm
                 try:
                     score = -ng(depth - 2, -beta, -beta + 1, ply + 1)
                 except _AbortSearch:
-                    # Keep make/unmake symmetric on every abort path: an
-                    # stop the search in here).
+                    # Restore the side to move before unwinding: every abort path
+                    # has to leave make/unmake symmetric.
                     self.wtm = not self.wtm
                     raise
                 self.wtm = not self.wtm
@@ -840,7 +855,7 @@ class B23CS1001:
             lst.pop()
 
     def _capture_moves(self, ksq, opp, in_check=False):
-        """Legal capture moves only (used by quiescence; avoids generating"""
+        """Legal capture moves only; no quiet moves (quiescence generator)."""
         b = self.b
         my_white = self.wtm
         found = []
@@ -911,7 +926,8 @@ class B23CS1001:
     def _quiescence(self, alpha, beta, qdepth=0):
         """Forcing-move search: captures, plus full evasions while in check."""
         self.qnodes += 1
-        # blocks below, exactly like _negamax/root do.
+        # Same abort check as _negamax (every 16 nodes); the restore blocks
+        # below mirror the ones in _negamax and the root loop.
         if self._deadline is not None and (self.qnodes & _ABORT_MASK) == 0 \
                 and time.monotonic() >= self._deadline:
             raise _AbortSearch
@@ -1171,7 +1187,8 @@ class B23CS1001:
             for fr, to in pseudo:
                 legal.append((fr, to, b[to], False))
             return legal
-        # expensive attack test is skipped for every other move.
+        # Pin mask: when not in check, only king moves and pieces on a ray
+        # through our king need the expensive attack test.
         if in_check is None:
             in_check = self._attacked(ksq, opp)
         must_test = in_check or (drive and opk >= 0)
@@ -1212,7 +1229,8 @@ class B23CS1001:
         b_pow = self.bpow
         nk = w_nk + b_nk
         if nk <= 12:
-            # has to collect pawn squares.
+            # Passed-pawn term (endgame only): no enemy pawn on this file or an
+            # adjacent one -> a runner counting 10 + 4 per rank advanced.
             for i in range(48):
                 p = b[i]
                 if p == WP:
@@ -1283,7 +1301,8 @@ class B23CS1001:
         elif b_pow - w_pow >= 100 and w_nk <= 1 and w_king >= 0 \
                 and b_king >= 0:
             score -= self._drive_bonus('b', b_king, w_king)
-        # a mate just as easily as a material-down one.
+        # King danger applies at level material too, at DANGER_EVEN weight: a
+        # level game can be lost to a mate as easily as a material-down one.
         if w_king >= 0 and b_king >= 0:
             if b_nk >= 2 and (b_pow - w_pow >= 100
                               or self._edge_danger(w_king, self._press_w)):
@@ -1339,7 +1358,9 @@ class B23CS1001:
         return press >= self.DANGER_PRESS_MIN
 
     def _king_danger(self, ksq, opp):
-      
+        """King safety for `ksq` against `opp`: edge/corner, covered flight
+        squares and rook cuts.  Gated by _edge_danger so most nodes skip it."""
+
         b = self.b
         kr, kc = divmod(ksq, BW)
         rowd = min(kr, BH - 1 - kr)

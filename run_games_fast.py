@@ -11,7 +11,11 @@ from board import GameEngine                # noqa: E402
 from config import EMPTY_SQUARE, PIECE_VALUES  # noqa: E402
 from B23CS1001 import B23CS1001             # noqa: E402
 from B23ME1074 import B23ME1074             # noqa: E402
-from B23ES1030 import B23ES1030      
+from B23ES1030 import B23ES1030 
+from p22cs201 import P22CS201
+from p25cs0004 import P25CS0004
+from B23CS1082 import B23CS1082
+from B23CS1082 import B23CS1082
 CAP = 150
 PLAYER_LIMIT = 60.0       # strict 1-minute clock per player; running out = loss
 
@@ -94,7 +98,7 @@ def play(white_cls, black_cls):
 
 def main():
     for pair in [
-                 (B23ME1074, B23CS1001), (B23CS1001, B23ME1074),]:
+                 (B23CS1082, B23CS1001), (B23CS1001, B23CS1082)]:
         play(*pair)
     print("FAST GAUNTLET DONE", flush=True)
 

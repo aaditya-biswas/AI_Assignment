@@ -3,12 +3,31 @@ from board import GameEngine, Move
 from p22cs201 import P22CS201
 from p25cs0004 import P25CS0004
 from config import *
-
+from B23CS1001 import B23CS1001
+from B23ES1030 import B23ES1030
+from B23ME1074 import B23ME1074
+from B23CS1082 import B23CS1082
 PIECE_SYMBOLS = {
     'wP': '♟', 'bP': '♙', 'wN': '♞', 'bN': '♘',
     'wB': '♝', 'bB': '♗', 'wR': '♜', 'bR': '♖', 'wK': '♚', 'bK': '♔',
     EMPTY_SQUARE: ' '
 }
+
+def official_score(final_state, white_to_move, timeout_loser,
+                   white_so_far, black_so_far):
+    """Official score card from AI_Assignment_I.pdf (see constraint.md 9).
+
+    checkmate / time-out -> winner 600, loser 0 (captures are overridden);
+    stalemate / turn-limit -> captured-piece points + 2 per check.
+    white_so_far/black_so_far are the legacy tallies, which equal captures
+    plus checks whenever no mate bonus has been added.
+    """
+    if timeout_loser is not None:                 # flagging = automatic loss
+        return (0, 600) if timeout_loser == '<White>' else (600, 0)
+    if final_state == "checkmate":
+        return (0, 600) if white_to_move else (600, 0)
+    return white_so_far, black_so_far
+
 
 class PlayerClock:
     """Manages the time for a blitz game."""
@@ -77,6 +96,7 @@ def run_game(white_player_type, black_player_type, total_time_seconds=60):
     rank_map = {i: str(8 - i) for i in range(BOARD_HEIGHT)}
 
     game_over = False
+    timeout_loser = None            # '<White>'/'<Black>' if a clock hit zero
     while not game_over and turn_counter < 150:
         player = white_player if engine.white_to_move else black_player
         color = '<White>' if engine.white_to_move else '<Black>'
@@ -97,12 +117,14 @@ def run_game(white_player_type, black_player_type, total_time_seconds=60):
             clock.white_time -= time_taken
             if clock.white_time <= 0:
                 print("\nBlack wins on time!")
+                timeout_loser = '<White>'
                 game_over = True
                 break
         else:
             clock.black_time -= time_taken
             if clock.black_time <= 0:
                 print("\nWhite wins on time!")
+                timeout_loser = '<Black>'
                 game_over = True
                 break
 
@@ -171,7 +193,20 @@ def run_game(white_player_type, black_player_type, total_time_seconds=60):
     print(f"  Total: {black_points}")
     print(f"Flags: White={white_flag}, Black={black_flag}")
 
+    # --- Official score card (the totals above are the legacy template) -----
+    # The template adds +300 for mate and lets the loser keep its captures; the
+    # PDF score card (constraint.md 9) is 600/0 with captures overridden, and a
+    # time-out is a loss.  Print both so the two harnesses agree.
+    ow, ob = official_score(final_game_state, engine.white_to_move,
+                            timeout_loser, white_points, black_points)
+    print("\nOfficial score card (match result):")
+    print(f"  White ({white_player.__class__.__name__}): {ow}")
+    print(f"  Black ({black_player.__class__.__name__}): {ob}")
+    print(f"  Margin: White {ow - ob:+d}")
+    if timeout_loser is not None:
+        print(f"  Decided by time-out: {timeout_loser} flagged -> 0 points")
+
 if __name__ == "__main__":
-    run_game(white_player_type=P25CS0004, black_player_type=P22CS201, total_time_seconds=60)
+    run_game(white_player_type=B23CS1082, black_player_type=B23CS1001, total_time_seconds=60)
 
 ## Replace by your AI agents for test purposes. Note you only have to submit one AI agent.

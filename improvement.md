@@ -492,3 +492,260 @@ Each of these must be gated behind the parity test plus a fresh `run_games_fast`
 comparison, because measured run-to-run spread on this opponent is ±~70 points.
 
 
+
+
+## Pruning log — strategies removed to fit the 60 KB single-file limit
+
+Submission file: **73,876 B / 1726 lines -> 51,346 B / ~1378 lines** (-22.5%),
+identical search tree (AST equality with docstrings ignored + depth-8 start search
+completes at exactly the same 6789 nodes).
+
+Removed because each had been measured as a net loss (all were already
+disabled in the shipped build, so the code was dead weight):
+
+| removed strategy | measured result |
+|---|---|
+| `ADJ_CHECK_PTS` (root bonus per check given) | paired games at 2 were ~80 pts of material per game worse than at 0 |
+| `ROOT_CHECK_W` + `_threat_checks` (tax on checking replies left) | check column fixed (mean check diff -81 -> -1.5 over 8 games) but material +97.5 -> -27.5, official +16.5 -> -7.0 = net loss |
+| `ADJ_TRADE_W` (exchange bonus while ahead) | 3W-1L / +48.0 official without it vs 2W-2L / -13.0 with it |
+| `_PROX_FAR` far-weighted tropism path | weight was 0, so the hot-table build did dead arithmetic |
+
+Comment/docstring compaction (18.5 KB of narrative) moved here; the
+executable code is unchanged.
+
+### Raw notes dropped from the submission file (verbatim)
+
+Single-file adversarial agent for Spartans Chess (6x8, no queens).
+
+"""
+
+        A game the harness still sees running after ADJ_CAP_PLY plies is decided
+        on this table, so the agent has to know the score it is playing for.
+        Only the plies not banked yet are read - the opponent's move, plus our
+        own move banked when we picked it - so the cost is a couple of
+        dictionary lookups per move: exact, and nothing that touches the clock.
+        """
+
+        The mover's colour is read from the engine, not from 'self.wtm': the
+        search flips 'wtm' while it runs and only '_load' restores it.
+        """
+
+        Root-only probe on the internal board (a few attack tests per root
+        move, once per move rather than per node), used as a bounded score tax:
+        the eval may still prefer a positional nicety, but not at the price of
+        handing over material.  Kings are excluded (they cannot be captured) and
+        the tax is capped, so a deliberate sacrifice or a mate stays available.
+        """
+
+        Called on every return path of get_best_move, so the next move has only
+        the opponent's reply left to read.  Everything read here comes from the
+        engine and from the check map built *before* the search started, never
+        from search-mutated state.
+        """
+
+        Sudden death on a 60 s clock: the remaining time is spread over the moves
+        still expected, then scaled by how critical the position looks.  The
+        multipliers encode what this variant rewards - a mate is worth 600, so
+        mate-critical positions (we are driving for mate, or we are in check) get
+        by far the most time, while a position whose best move has not changed
+        for several plies and whose score is steady is treated as obvious and
+        gets less.  'hard' is the ceiling the search may extend to when the root
+        move keeps changing or the score drops (panic time); it is capped so no
+        single move can eat the clock, because running out of time LOSES.
+        """
+
+        Reordering only matters for moves the search scores equally (a root move
+        is kept only on a strict improvement), so this can never give away a
+        tactic or a mate - it just decides which of two equal moves to prefer.
+        """
+        (TT move, killers and history are passed in)."""
+        quiet moves and keeps the delta-pruning friendly 4-tuple shape)."""
+
+        This replaces the old "generate every legal move then filter" version
+        (which paid ~30 attack tests per node for a handful of captures) with a
+        capture-only generator, MVV-LVA ordering and delta pruning.  In check,
+        all evasions are searched so simple mates are still detected at the
+        horizon.
+        """
+
+        Returns (my_king, opp_king, in_check, few_pieces, mate_drive).
+        mate_drive is true when the side to move is up by >= a rook against an
+        opponent that has at most one non-king piece left.
+        """
+
+        Uses the precomputed geometry tables (no bounds tests, no _idx calls),
+        which is the single hottest helper in the search.
+        """
+        (only these quiet moves can ever expose the king)."""
+
+        Rules mirror board.py exactly (generate-then-validate); the king of the
+        side that just moved must not be left in check.  When 'drive' is set we
+        additionally record whether each move gives check (mate-drive needs to
+        order forcing moves first).
+        """
+
+        Material + piece-square tables dominate (they mirror the tournament
+        scoring), with small centralisation, passed-pawn and king-safety terms.
+        The material/PST/centre part and the king squares are maintained
+        incrementally on every make/unmake (see '_load'); only the endgame
+        passed-pawn scan touches the board.
+        """
+        while the leader's king and rook(s) move in for the mate."""
+
+        True only when the king sits on or next to an edge - the only place being
+        boxed in really matters - and the incremental tropism already says enemy
+        material is near it.  Quiet middlegame positions therefore never pay for
+        the scan, and the even-material danger term stays affordable.
+        """
+FEW_PIECE_LIMIT = 9      # at/below this many pieces: cheap terminal check
+# ------------------------------------------------------------------ int board
+# Internally the agent works on a flat list of small ints instead of the
+# engine's 2-char strings (0 empty, 1..5 = white P/N/B/R/K, 6..10 = black).
+# Integer compares/indexing are markedly faster than string slicing, which is
+# King tropism: running total of enemy material near each king, maintained
+# incrementally in _eval_add/_eval_sub so it is free per evaluation.
+# Fully precomputed static score per (piece code, square): signed material +
+# piece-square table + centralisation folded into a single table lookup, so
+# the hot evaluation loop does one indexing per occupied square.
+# The official scorecard pays ONLY material (and checks), so the search must not
+# trade a 20-point pawn for a positional nicety: _POS_SCALE shrinks the
+# positional part (piece-square table + centralisation) while the material part
+# stays exactly at the tournament values.  Measured over a fixed 48-position
+# suite, 1.0 left 6.7 points of material hanging per position, 0.5 leaves 2.5,
+# and 0.25 is worse again (4.6) - so 0.5 is what this variant wants.
+# ---------------------------------------------------------------- fast tables
+# Precomputed per-square attack geometry so the hot paths never do bounds
+# checks or function calls.  Built once at import time (48 squares).
+_ABORT_MASK = 15           # test the hard deadline every 16 nodes.  The drift a
+# Inverse pawn tables: the squares a white/black pawn would have to stand on in
+# order to attack a given square (same geometry as the opposite pawn's captures).
+# Late-Move-Reduction lookup: R(d, i) = floor(1 + ln(d)*ln(i+1)/2) for d>2, i>2,
+    # ------------------------------------------- time control (self-contained)
+    # Everything the agent needs to budget its own clock lives in THIS file, so
+    # the submission is a genuine single file: the official runner only has to
+    # construct it and call get_best_move().  The tournament gives each player
+    # 1 minute for the whole game (sudden death, no increment) and running out
+    # of time LOSES, so the allocator always keeps a reserve back.
+    #
+    # Scheme (after the usual engine practice: a soft bound the search aims to
+    # finish within, and a hard bound it may extend to when the position turns
+    #   soft = remaining/moves_left * TIME_FRACTION * criticality
+    #   hard = min(soft * HARD_FACTOR, spendable, remaining*MAX_SHARE_CRIT)
+    MIN_MOVE_SECONDS = 0.30        # never move instantly (endgames need real depth)
+    # The reserve is deliberately generous and it is a *hard pool*: '_plan_time'
+    # never plans to spend past GAME_SECONDS - RESERVE_SECONDS, and it shares
+    # what is left of that pool over the moves still expected, so a long game
+    # glides into small searches instead of instant ones.  The runner times the
+    # WHOLE get_best_move() call and a time-out loses the game outright (600
+    # points), so the reserve has to cover the abort granularity, per-move
+    # bookkeeping and a loaded machine.  'test_budget.py --stress' plays whole
+    # games on the real clock and fails if any move leaves less than 3.5 s.
+    # Even if that pool is ever exhausted, the search still gets TINY_SLICE per
+    # move - enough for depth 1-2 instead of a move in generation order - and it
+    # may only eat into the reserve down to MIN_RESERVE.  The gap between the two
+    # constants is what covers the abort granularity and per-move bookkeeping.
+    # --- dynamic factors: positional advantage / criticality ---------------
+    # --- check-avoidance (king pressure) evaluation ------------------------
+    # Checks are never priced and never ducked: both were measured as net losses
+    # (they trade material for 2-point checks).  King safety and depth attack the
+    # check column instead.  Measurements: see improvement.md.
+    # Mate risk at LEVEL material: the danger term used to switch on only once we
+    # were already a rook down, so a level game could walk into a mate with the
+    # king's exposure priced at nothing.  A scaled share now applies whenever the
+    # enemy keeps attackers near a king that is on or next to an edge.
+    # Mate defence by search: a position in check is a forcing line, so extend it
+    # by one ply, bounded by the budget, the distance from the root and the clock.
+    CHECK_EXT = 1                  # extend one ply when the side to move is in check
+    # --- adjudication scorecard (the tournament's points table) ------------
+    # Captures score PIECE_VALUES (P20 N70 B70 R100) plus 2 points per check
+    # GIVEN, a mate is 600 and overrides that, a time-out is a loss.  The harness
+    # adjudicates a game still running at ADJ_CAP_PLY plies, so the agent keeps
+    # the exact tally and plays to the score late in the game.
+        # Cross-move search history driving the dynamic time control.
+        # King-pressure state (check avoidance), maintained incrementally.
+        # Adjudication tally (official points table: captures + 2 per check).
+    # ------------------------------------------------------------- setup
+        # Incremental evaluation state (kept in sync on every make/unmake).
+        # King pressure (check avoidance): computed once here, then maintained
+        # Official points table (captures + checks) and the late-game mode that
+    # -------------------------------------------------- adjudication table
+            # Only the last ply can still be tested for a delivered check: if we
+        # Play-to-the-score mode: late in a game that will be adjudicated, our
+        # own points are what count, so a lead is worth protecting and a
+        # deficit is worth chasing (a check is +2, a mate is 600).
+            # A captured piece stops exerting its own pressure on the ENEMY
+            # king (the king squares have not moved yet, so this is exact).
+            # The mover carries its king pressure along with it.  Most moves are
+            # far from the enemy king, where both lookups are 0 and the whole
+        # Each square is a 0..10 code, so bytes() is a very fast exact key.
+    # ------------------------------------------------------------ public API
+        # The clock starts on the FIRST line: the runner times this whole call,
+        # so _load(), root-move generation and per-move overheads have to be
+        # counted here too, or the reserve silently leaks a little each move.
+            # It still has to be banked: a forced move can give check (+2).
+        # Dynamic time control: (soft, hard) seconds for this move, derived from
+        # the clock, the game phase and how critical the position is.
+        # Which root moves give check (used by the adjudication tally and by root
+        # ordering).  Computed once per move and never fed into the eval, so the
+        # Fresh check-extension budget for this move (a per-move resource).
+        limit = soft_limit     # raised to hard_limit while the move is unstable
+                # Do not start an iteration that cannot finish in the budget.
+                # Aspiration window centred on the last *search* score (the
+                # previous version centred it on the static eval, which made
+                # every root move fail low and silently kept a stale move).
+                # A forced mate for us is already the best possible outcome.
+            # An unchanged root move over consecutive moves = "easy move".
+        # Bank the move we are about to play into the adjudication tally (its
+        # captures, and its +2 if it gives check), so the next move only has the
+        # Hard pool: the reserve below is never spent, whatever the multipliers
+        # say.  Without this the MAX_SHARE_CRIT crawl spends 35% of whatever is
+        # left on every single move, and no per-move guard can bound that sum -
+        # real games were measured at 59.6 s and 59.1 s of the 60 s clock.
+        # The floor must scale with the clock, otherwise a fixed minimum would
+        # spend more than half of what is left in a near-empty clock.  It is
+        # ... but a move is never free: once the pool is gone the search still
+        # gets a tiny slice, which is enough for depth 1-2 and far better than
+        # returning a move in generation order.  It may only eat into the
+        # reserve down to MIN_RESERVE, which is what covers the abort drift.
+                # Protecting a lead: demote a piece left hanging, because that is
+                # exactly how the opponent takes the points back before the cap.
+    # ---------------------------------------------------------------- search
+            # Convert the stored node-relative mate score back to root-relative.
+        # Horizon handling runs before the board scan: quiescence and the eval
+        # recompute what they need, so _snapshot is skipped at leaf nodes.
+        # Check extension: being in check means a forcing line, and forcing lines
+        # are exactly what produce the mates we have been losing to (plies 62-96
+        # in several recent games).  Search one ply deeper there, bounded by a
+        # per-move budget and by ply, so a check-heavy game cannot blow the tree
+                    # unfinished null move must still hand 'wtm' back, or the
+                    # caller unwinds with the board and the side to move out of
+                    # step (the qsearch guard and the node-count abort can both
+        # Ordering inputs are hoisted out of the per-move key function (the
+        # killer lookup used to run once per move inside the key lambda).
+            # Bounded ("gravity") update keeps early scores from dominating.
+            # Same pin shortcut as _legal_moves: only king moves and pinned
+            # pieces can expose the king, so most captures skip the test.
+        # Hard-deadline guard for the forcing search: _negamax only tests the
+        # deadline every 255 nodes, so a capture-rich tree at QMAX can overshoot
+        # inside a single node.  The abort is re-raised through the unmake
+        # King squares are tracked incrementally (self._wk / self._bk).
+    # ------------------------------------------------------------- snapshot
+    # ------------------------------------------------------ attack/legality
+        # Only king moves and pinned-piece moves can expose the king, so when
+        # not in check (and not driving for mate, which needs 'gives') the
+    # --------------------------------------------------------- evaluation
+        # Everything below is maintained incrementally (see _load / make-unmake),
+        # so the common midgame evaluation is O(1) - no 48-square scan.
+            # Passed-pawn scan (endgame only), so the common midgame eval never
+                # King shield (inlined): friendly pawns in front of each king.
+        # Check avoidance: enemy material near a king is what generates the
+        # endless stream of +2 checks (and then the mates).  Bounded by
+        # PRESS_CAP and only counted while the attacker still has real material,
+        # so it can never outweigh material - and never a mate, because a mate
+        # score is ~100000 and always overrules any evaluation term.
+        # Defensive drive: the case the bonus above does *not* cover, i.e. the
+        # trailing side still has two or more non-king pieces.  Losing a king is
+        # worth 600, so a boxed-in king is penalised well before the endgame has
+        # been stripped down to a bare king - and now also when the material is
+        # level, at a fraction of the weight, because a level game can be lost to
+        # Expose the king squares so quiescence does not need a second scan.
